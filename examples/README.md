@@ -24,6 +24,14 @@ or run the source `.py` files directly.
   Validated against the numerical FOC for the optimal portfolio share;
   sweeps correlation to show the diversification effect (π* runs from
   ~0.75 at ρ = -0.8 to a corner at 1.0 once ρ ≳ 0.4).
+- `06_regime_switching_option/regime_switching_option.ipynb` —
+  American put under **regime-switching volatility**: a 2-state
+  `MarkovChain` flips between calm (σ=0.15) and turbulent (σ=0.40)
+  regimes. The solver advances the regime via its transition matrix
+  during backward induction. Value functions and exercise boundaries
+  shown per regime, sandwiched between three constant-vol references
+  (σ_low, σ_high, σ_stationary_avg); the turbulent exercise boundary
+  sits well below the calm one (high vol → hold longer).
 
 The notebooks are auto-generated from the `.py` source files via
 `jupytext --to ipynb <file>.py`. Edit the `.py` (easier to diff,
