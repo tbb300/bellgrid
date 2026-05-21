@@ -40,9 +40,14 @@
 #
 # $$ c^*_t = (1-\beta)\, w_t. $$
 #
-# We truncate to a finite horizon by setting the terminal reward to the
-# closed-form $V$, which puts the truncated DP in steady state — every
-# period reproduces the stationary policy.
+# We validate against the closed form two ways:
+#
+# 1. **Finite-horizon backward induction** with $V_T = A + B \log w$ as
+#    the terminal reward. Since $V^*$ is a fixed point of the Bellman
+#    operator, the truncated DP sits in steady state at every $t$.
+# 2. **Infinite-horizon policy iteration** with no terminal reward.
+#    Iterate the Bellman operator from $V_0 = 0$ until convergence; the
+#    result is $V^*$ up to discretization error, with no truncation hack.
 
 # %%
 import math
@@ -60,7 +65,7 @@ from bellgrid import (
 )
 from bellgrid.grids import RegularGrid, WarpedGrid
 from bellgrid.shocks import Normal
-from bellgrid.solvers import BackwardInduction
+from bellgrid.solvers import BackwardInduction, PolicyIteration
 
 
 # %% [markdown]
@@ -84,7 +89,7 @@ print(f"closed form: c/w = {expected_rate:.4f}, V(w) = {A:.4f} + {B:.4f}*log(w)"
 
 
 # %% [markdown]
-# ## Bellgrid problem
+# ## Finite-horizon problem (backward induction)
 #
 # Wealth lives on an asinh-warped grid so points concentrate near zero
 # (where the value function has the most curvature). The terminal reward
@@ -176,6 +181,85 @@ ax2.set_xlabel("wealth $w$")
 ax2.set_ylabel("$V_{bellgrid} - V_{closed}$")
 ax2.set_title("Residual error")
 ax2.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# %% [markdown]
+# ## Infinite-horizon problem (policy iteration)
+#
+# Same `transition` and `reward` as the finite-horizon problem, but with
+# `horizon=None` and no `terminal_reward`. `PolicyIteration` iterates the
+# Bellman operator from $V_0 = 0$ until $\|V_\text{new} - V\|_\infty < \mathrm{tol}$.
+# The Bellman operator is a contraction with factor $\beta$, so
+# convergence is geometric: at $\beta = 0.96$ and $\mathrm{tol} = 10^{-7}$
+# expect a few hundred iterations.
+#
+# **No terminal-reward hack here** — the answer comes purely from
+# iterating the operator to its fixed point.
+
+# %%
+problem_inf = Problem(
+    states=problem.states,
+    actions=problem.actions,
+    transition=transition,
+    reward=reward,
+    shocks=problem.shocks,
+    horizon=None,
+    discount=beta,
+    # no terminal_reward: V_0 = 0
+)
+
+policy_inf, value_inf = solve(
+    problem_inf,
+    state_grid={"wealth": WarpedGrid(n=128)},
+    action_grid={"consume": RegularGrid(n=500)},
+    solver=PolicyIteration(n_quad=7, tol=1e-7),
+)
+
+v_inf = value_inf({"wealth": w_query}, t=None).numpy()
+rate_inf = (policy_inf({"wealth": w_query}, t=None)["consume"] / w_query).numpy()
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
+ax1.plot(w_query.numpy(), v_bellgrid, lw=2.5, color="C0",
+         label=f"BI finite (t={T // 2}, with closed-form terminal)")
+ax1.plot(w_query.numpy(), v_inf, lw=2.5, color="C3",
+         label="PI infinite (no terminal)")
+ax1.plot(w_query.numpy(), v_closed, ls="--", color="black", lw=1.5,
+         label="closed form $V^*$")
+ax1.set_xlabel("wealth $w$")
+ax1.set_ylabel("$V(w)$")
+ax1.set_title("BI vs PI vs closed form")
+ax1.legend(fontsize=9)
+ax1.grid(alpha=0.3)
+
+ax2.plot(w_query.numpy(), v_bellgrid - v_closed, lw=2, color="C0",
+         label="BI − closed form")
+ax2.plot(w_query.numpy(), v_inf - v_closed, lw=2, color="C3",
+         label="PI − closed form")
+ax2.axhline(0.0, color="black", lw=0.5)
+ax2.set_xlabel("wealth $w$")
+ax2.set_ylabel("$V - V^*$")
+ax2.set_title("Residual to closed form")
+ax2.legend(fontsize=9)
+ax2.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# Consumption rates side-by-side
+fig, ax = plt.subplots(figsize=(7, 4.5))
+ax.plot(w_query.numpy(), rate_bellgrid, lw=2.5, color="C0",
+        label=f"BI finite (t={T // 2})")
+ax.plot(w_query.numpy(), rate_inf, lw=2.5, color="C3",
+        label="PI infinite")
+ax.axhline(expected_rate, color="black", ls="--", lw=1.5,
+           label=f"closed form $1-\\beta = {expected_rate:.3f}$")
+ax.set_xlabel("wealth $w$")
+ax.set_ylabel("consumption rate $c^* / w$")
+ax.set_title("Consumption rate: both solvers vs closed form")
+ax.set_ylim(0.0, 0.07)
+ax.legend()
+ax.grid(alpha=0.3)
 plt.tight_layout()
 plt.show()
 

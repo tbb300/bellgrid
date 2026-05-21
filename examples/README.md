@@ -6,7 +6,10 @@ alongside the core dependencies. Open the `.ipynb` files in JupyterLab,
 or run the source `.py` files directly.
 
 - `01_merton/merton.ipynb` — log-utility Merton, validated against the
-  $V(w) = A + B\log w$ closed form. Convergence sweep included.
+  $V(w) = A + B\log w$ closed form via **both** solvers: finite-horizon
+  `BackwardInduction` (with closed-form terminal) and infinite-horizon
+  `PolicyIteration` (no terminal hack, iterated to convergence).
+  Convergence sweep included.
 - `02_carroll_deaton/carroll_deaton.ipynb` — CRRA lifecycle savings with
   a borrowing constraint; shows the kinked consumption function and the
   buffer-stock target.
