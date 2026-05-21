@@ -38,3 +38,17 @@ packages = ["src/bellgrid"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Pull torch from the PyTorch CUDA 12.6 index on Linux x86_64, so installs
+# on machines with a CUDA 12.x driver get a GPU-capable torch out of the
+# box. Other platforms fall through to the default PyPI index (CPU-only
+# torch).
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", marker = "platform_system == 'Linux' and platform_machine == 'x86_64'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
