@@ -15,9 +15,10 @@ import torch
 
 from .problem import ContinuousAction, ContinuousState, Problem
 from .shocks.lognormal import Lognormal
+from .shocks.multivariate_normal import MultivariateNormal
 from .shocks.normal import Normal
 
-_SUPPORTED_SHOCKS = (Normal, Lognormal)
+_SUPPORTED_SHOCKS = (Normal, Lognormal, MultivariateNormal)
 
 
 def simulate(
@@ -123,10 +124,15 @@ def simulate(
         for name in action_names:
             paths[name][:, i] = action[name]
 
-        shock = {
-            s.name: s.sample(n, generator=gen, dtype=dtype, device=device)
-            for s in problem.shocks
-        }
+        # Normal/Lognormal.sample returns a tensor; MultivariateNormal.sample
+        # returns {name: tensor} (one per dimension). Normalise to a dict.
+        shock = {}
+        for s in problem.shocks:
+            sampled = s.sample(n, generator=gen, dtype=dtype, device=device)
+            if isinstance(sampled, dict):
+                shock.update(sampled)
+            else:
+                shock[s.name] = sampled
 
         r = problem.reward(state, action, shock, t)
         r = torch.as_tensor(r, dtype=dtype, device=device).broadcast_to((n,)).contiguous()

@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from bellgrid.shocks import Lognormal, Normal
+from bellgrid.shocks import Lognormal, MultivariateNormal, Normal
 
 
 def _moment(nodes: torch.Tensor, weights: torch.Tensor, k: int) -> float:
@@ -174,3 +174,123 @@ def test_lognormal_sample_shape_and_dtype():
     s = Lognormal(mu=0.0, sigma=0.5).sample(50, dtype=torch.float32)
     assert s.shape == (50,)
     assert s.dtype == torch.float32
+
+
+# --- MultivariateNormal shock ------------------------------------------
+
+
+def test_mvn_defaults_are_standard():
+    mvn = MultivariateNormal(names=("a", "b"))
+    assert mvn.K == 2
+    assert mvn.mean.tolist() == [0.0, 0.0]
+    assert mvn.cov.tolist() == [[1.0, 0.0], [0.0, 1.0]]
+
+
+def test_mvn_empty_names_raises():
+    with pytest.raises(ValueError, match="at least one name"):
+        MultivariateNormal(names=())
+
+
+def test_mvn_duplicate_names_raises():
+    with pytest.raises(ValueError, match="must be unique"):
+        MultivariateNormal(names=("a", "a"))
+
+
+def test_mvn_mean_shape_mismatch_raises():
+    with pytest.raises(ValueError, match="mean must have shape"):
+        MultivariateNormal(names=("a", "b"), mean=[0.0])
+
+
+def test_mvn_cov_shape_mismatch_raises():
+    with pytest.raises(ValueError, match="cov must have shape"):
+        MultivariateNormal(names=("a", "b"), cov=[[1.0, 0.0]])
+
+
+def test_mvn_asymmetric_cov_raises():
+    with pytest.raises(ValueError, match="symmetric"):
+        MultivariateNormal(names=("a", "b"), cov=[[1.0, 0.1], [0.2, 1.0]])
+
+
+def test_mvn_non_positive_definite_cov_raises():
+    nodes_fn = lambda: MultivariateNormal(names=("a", "b"), cov=[[1.0, 2.0], [2.0, 1.0]]).nodes_and_weights(5)
+    with pytest.raises(ValueError, match="positive definite"):
+        nodes_fn()
+
+
+def test_mvn_weights_sum_to_one():
+    mvn = MultivariateNormal(
+        names=("a", "b"), mean=[0.5, -0.3],
+        cov=[[1.0, 0.3], [0.3, 0.5]],
+    )
+    for n_quad in (3, 5, 7):
+        _, w = mvn.nodes_and_weights(n_quad)
+        assert w.sum().item() == pytest.approx(1.0, abs=1e-12)
+
+
+def test_mvn_first_moments_match_mean():
+    """E[X_i] == mean[i] up to GH exactness."""
+    mean = [0.5, -0.3, 1.0]
+    mvn = MultivariateNormal(
+        names=("a", "b", "c"), mean=mean,
+        cov=[[1.0, 0.3, -0.1], [0.3, 0.5, 0.2], [-0.1, 0.2, 2.0]],
+    )
+    nodes, w = mvn.nodes_and_weights(5)
+    for i, name in enumerate(("a", "b", "c")):
+        em = (w * nodes[name]).sum().item()
+        assert em == pytest.approx(mean[i], abs=1e-10)
+
+
+def test_mvn_covariance_matches_cov():
+    """E[(X_i - mu_i)(X_j - mu_j)] == cov[i, j]."""
+    mean = [0.5, -0.3]
+    cov = [[1.0, 0.4], [0.4, 0.6]]
+    mvn = MultivariateNormal(names=("a", "b"), mean=mean, cov=cov)
+    nodes, w = mvn.nodes_and_weights(5)
+    Xa = nodes["a"] - mean[0]
+    Xb = nodes["b"] - mean[1]
+    var_a = (w * Xa**2).sum().item()
+    var_b = (w * Xb**2).sum().item()
+    cov_ab = (w * Xa * Xb).sum().item()
+    assert var_a == pytest.approx(cov[0][0], abs=1e-10)
+    assert var_b == pytest.approx(cov[1][1], abs=1e-10)
+    assert cov_ab == pytest.approx(cov[0][1], abs=1e-10)
+
+
+def test_mvn_diagonal_cov_decouples():
+    """Diagonal cov ⇒ E[X_a * X_b] == 0 (independent dimensions)."""
+    mvn = MultivariateNormal(
+        names=("a", "b"), cov=[[1.0, 0.0], [0.0, 4.0]],
+    )
+    nodes, w = mvn.nodes_and_weights(5)
+    cov_ab = (w * nodes["a"] * nodes["b"]).sum().item()
+    assert cov_ab == pytest.approx(0.0, abs=1e-12)
+
+
+def test_mvn_nodes_count_is_n_quad_to_the_K():
+    mvn = MultivariateNormal(names=("a", "b"))
+    nodes, w = mvn.nodes_and_weights(5)
+    assert w.numel() == 25
+    assert nodes["a"].numel() == 25
+
+
+def test_mvn_sample_mean_and_cov_match_targets():
+    """Many samples have empirical mean ≈ mean, cov ≈ cov."""
+    mean = [0.5, -0.3]
+    cov = [[1.0, 0.4], [0.4, 0.6]]
+    mvn = MultivariateNormal(names=("a", "b"), mean=mean, cov=cov)
+    s = mvn.sample(50_000, generator=torch.Generator().manual_seed(0))
+    Xa, Xb = s["a"], s["b"]
+    assert abs(Xa.mean().item() - 0.5) < 0.02
+    assert abs(Xb.mean().item() + 0.3) < 0.02
+    var_a = ((Xa - Xa.mean()) ** 2).mean().item()
+    var_b = ((Xb - Xb.mean()) ** 2).mean().item()
+    cov_ab = ((Xa - Xa.mean()) * (Xb - Xb.mean())).mean().item()
+    assert abs(var_a - 1.0) < 0.05
+    assert abs(var_b - 0.6) < 0.05
+    assert abs(cov_ab - 0.4) < 0.05
+
+
+def test_mvn_is_frozen():
+    mvn = MultivariateNormal(names=("a", "b"))
+    with pytest.raises(AttributeError):
+        mvn.mean = [1.0, 1.0]

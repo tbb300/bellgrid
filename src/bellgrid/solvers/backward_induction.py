@@ -19,9 +19,10 @@ from ..grids.warped import WarpedGrid
 from ..interpolation.multilinear import multilinear
 from ..problem import ContinuousAction, ContinuousState, DiscreteAction, Problem
 from ..shocks.lognormal import Lognormal
+from ..shocks.multivariate_normal import MultivariateNormal
 from ..shocks.normal import Normal
 
-_SUPPORTED_SHOCKS = (Normal, Lognormal)
+_SUPPORTED_SHOCKS = (Normal, Lognormal, MultivariateNormal)
 _SUPPORTED_ACTIONS = (ContinuousAction, DiscreteAction)
 _SUPPORTED_GRIDS = (RegularGrid, WarpedGrid)
 
@@ -285,18 +286,23 @@ def _backward_induction(
             action_kinds[a.name] = "discrete"
 
     # ---- shock quadrature ----------------------------------------------
+    # Normal/Lognormal return (tensor, weights); MultivariateNormal returns
+    # ({name: tensor}, weights). Normalise to a dict in either case.
     if supported:
         shock = supported[0]
-        shock_nodes, shock_weights = shock.nodes_and_weights(
+        raw, shock_weights = shock.nodes_and_weights(
             solver.n_quad, dtype=dtype, device=device
         )
-        N_q = shock_nodes.numel()
-        shock_name = shock.name
+        if isinstance(raw, dict):
+            shock_values = raw
+            N_q = next(iter(shock_values.values())).numel()
+        else:
+            shock_values = {shock.name: raw}
+            N_q = raw.numel()
     else:
-        shock_nodes = torch.zeros(1, dtype=dtype, device=device)
+        shock_values = {}
         shock_weights = torch.ones(1, dtype=dtype, device=device)
         N_q = 1
-        shock_name = None
 
     # ---- initialize V at the post-horizon boundary ---------------------
     if problem.terminal_reward is None:
@@ -328,14 +334,13 @@ def _backward_induction(
         for name, tensor in action_tensors.items()
     }
 
-    # Shock broadcasting: (N_q,) → (1, ..., 1, 1, N_q) → full
+    # Shock broadcasting: (N_q,) → (1, ..., 1, 1, N_q) → full, one per
+    # shock dimension (multivariate shocks have multiple named entries).
     shock_view = (1,) * K + (1, N_q)
-    if shock_name is not None:
-        shock_b = shock_nodes.view(shock_view).expand(full_shape)
-        shock_dict_b = {shock_name: shock_b}
-    else:
-        shock_dict_b = {}
-
+    shock_dict_b = {
+        name: nodes.view(shock_view).expand(full_shape)
+        for name, nodes in shock_values.items()
+    }
     weights_b = shock_weights.view(shock_view)
 
     for t in reversed(horizon):
