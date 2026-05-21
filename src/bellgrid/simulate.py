@@ -14,7 +14,10 @@ from typing import Callable, Optional
 import torch
 
 from .problem import ContinuousAction, ContinuousState, Problem
+from .shocks.lognormal import Lognormal
 from .shocks.normal import Normal
+
+_SUPPORTED_SHOCKS = (Normal, Lognormal)
 
 
 def simulate(
@@ -64,8 +67,11 @@ def simulate(
     cont_actions = [a for a in problem.actions if isinstance(a, ContinuousAction)]
     if len(cont_actions) != len(problem.actions):
         raise NotImplementedError("simulate currently supports only ContinuousAction")
-    if any(not isinstance(s, Normal) for s in problem.shocks):
-        raise NotImplementedError("simulate currently supports only Normal shocks")
+    if any(not isinstance(s, _SUPPORTED_SHOCKS) for s in problem.shocks):
+        raise NotImplementedError(
+            f"simulate currently supports only "
+            f"{[c.__name__ for c in _SUPPORTED_SHOCKS]} shocks"
+        )
     if problem.horizon is None:
         raise NotImplementedError("simulate does not support infinite horizon yet")
     if callable(problem.discount):
@@ -114,10 +120,10 @@ def simulate(
         for name in action_names:
             paths[name][:, i] = action[name]
 
-        shock = {}
-        for s in problem.shocks:
-            z = torch.randn(n, generator=gen, dtype=dtype, device=device)
-            shock[s.name] = z * s.sigma
+        shock = {
+            s.name: s.sample(n, generator=gen, dtype=dtype, device=device)
+            for s in problem.shocks
+        }
 
         r = problem.reward(state, action, shock, t)
         r = torch.as_tensor(r, dtype=dtype, device=device).broadcast_to((n,)).contiguous()

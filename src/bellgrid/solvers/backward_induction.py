@@ -13,7 +13,10 @@ import torch
 from ..grids.regular import RegularGrid
 from ..interpolation.multilinear import multilinear
 from ..problem import ContinuousAction, ContinuousState, Problem
+from ..shocks.lognormal import Lognormal
 from ..shocks.normal import Normal
+
+_SUPPORTED_SHOCKS = (Normal, Lognormal)
 
 
 @dataclass(frozen=True)
@@ -97,12 +100,14 @@ def _backward_induction(
     if len(cont_actions) == 0:
         raise ValueError("Problem has no actions")
 
-    normal_shocks = [s for s in problem.shocks if isinstance(s, Normal)]
-    if len(normal_shocks) != len(problem.shocks):
-        raise NotImplementedError("tracer supports only Normal shocks")
-    if len(normal_shocks) > 1:
+    supported = [s for s in problem.shocks if isinstance(s, _SUPPORTED_SHOCKS)]
+    if len(supported) != len(problem.shocks):
         raise NotImplementedError(
-            f"tracer supports at most one Normal shock; got {len(normal_shocks)}"
+            f"tracer supports only {[c.__name__ for c in _SUPPORTED_SHOCKS]} shocks"
+        )
+    if len(supported) > 1:
+        raise NotImplementedError(
+            f"tracer supports at most one shock; got {len(supported)}"
         )
 
     if problem.horizon is None:
@@ -177,8 +182,8 @@ def _backward_induction(
         action_tensors[action.name] = a.contiguous()
 
     # ---- shock quadrature ----------------------------------------------
-    if normal_shocks:
-        shock = normal_shocks[0]
+    if supported:
+        shock = supported[0]
         shock_nodes, shock_weights = shock.nodes_and_weights(
             solver.n_quad, dtype=dtype, device=device
         )

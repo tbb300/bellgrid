@@ -55,3 +55,14 @@ class Normal:
             torch.as_tensor(nodes, dtype=dtype, device=device),
             torch.as_tensor(weights, dtype=dtype, device=device),
         )
+
+    def sample(
+        self,
+        n: int,
+        *,
+        generator: Optional[torch.Generator] = None,
+        dtype: torch.dtype = torch.float64,
+        device: str | torch.device = "cpu",
+    ) -> torch.Tensor:
+        z = torch.randn(n, generator=generator, dtype=dtype, device=device)
+        return z * self.sigma

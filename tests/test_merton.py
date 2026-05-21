@@ -20,7 +20,7 @@ import torch
 
 from bellgrid import ContinuousAction, ContinuousState, Problem, solve
 from bellgrid.grids import RegularGrid, WarpedGrid
-from bellgrid.shocks import Normal
+from bellgrid.shocks import Lognormal, Normal
 from bellgrid.solvers import BackwardInduction
 
 
@@ -246,6 +246,69 @@ def test_merton_print_resolution_sweep():
                 )
             prev_v_err = v_err
         print()
+
+
+def test_merton_lognormal_matches_normal_with_exp_in_transition():
+    """The Lognormal shock and the equivalent Normal("z") + exp(mu+sigma*z)
+    written into transition give the same solution. Lognormal is just
+    sugar over the standard pattern; switching shouldn't change the math."""
+    beta, mu, sigma = 0.96, 0.04, 0.15
+    A, B = _closed_form_coefficients(beta, mu)
+
+    def transition_lognormal(state, action, shock, _t):
+        return {
+            "wealth": (state["wealth"] - action["consume"]) * shock["ret"]
+        }
+
+    def reward(_state, action, _shock, _t):
+        return torch.log(action["consume"])
+
+    def terminal_reward(state):
+        return A + B * torch.log(state["wealth"])
+
+    problem_lognormal = Problem(
+        states=[ContinuousState("wealth", warp="asinh", range=(1e-3, 50.0))],
+        actions=[ContinuousAction("consume", bounds=(1e-6, "wealth"))],
+        transition=transition_lognormal,
+        reward=reward,
+        shocks=[Lognormal("ret", mu=mu, sigma=sigma)],
+        horizon=range(0, 10),
+        discount=beta,
+        terminal_reward=terminal_reward,
+    )
+
+    policy_ln, value_ln = solve(
+        problem_lognormal,
+        state_grid={"wealth": WarpedGrid(n=128)},
+        action_grid={"consume": RegularGrid(n=500)},
+        solver=BackwardInduction(n_quad=7),
+    )
+
+    # The Normal-with-exp formulation (using _build_problem) under the
+    # same wealth range and consume bounds.
+    problem_normal = _build_problem(
+        beta, mu, sigma, T=10,
+        warp="asinh", wealth_range=(1e-3, 50.0), consume_low=1e-6,
+    )
+    policy_no, value_no = solve(
+        problem_normal,
+        state_grid={"wealth": WarpedGrid(n=128)},
+        action_grid={"consume": RegularGrid(n=500)},
+        solver=BackwardInduction(n_quad=7),
+    )
+
+    test_w = torch.tensor([2.0, 5.0, 10.0, 20.0], dtype=torch.float64)
+    v_ln = value_ln({"wealth": test_w}, t=5)
+    v_no = value_no({"wealth": test_w}, t=5)
+    assert torch.allclose(v_ln, v_no, atol=1e-12), (
+        f"Lognormal V: {v_ln.tolist()}\nNormal+exp V: {v_no.tolist()}"
+    )
+
+    c_ln = policy_ln({"wealth": test_w}, t=5)["consume"]
+    c_no = policy_no({"wealth": test_w}, t=5)["consume"]
+    assert torch.allclose(c_ln, c_no, atol=1e-12), (
+        f"Lognormal c: {c_ln.tolist()}\nNormal+exp c: {c_no.tolist()}"
+    )
 
 
 def test_merton_warped_grid_reclaims_low_wealth():
