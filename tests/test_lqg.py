@@ -99,8 +99,8 @@ def _build_lqg_problem():
 
     return Problem(
         states=[
-            ContinuousState("x1", range=(-3.0, 3.0)),
-            ContinuousState("x2", range=(-3.0, 3.0)),
+            ContinuousState("x1", range=(-5.0, 5.0)),
+            ContinuousState("x2", range=(-5.0, 5.0)),
         ],
         actions=[ContinuousAction("u", bounds=(-5.0, 5.0))],
         transition=transition,
@@ -142,6 +142,11 @@ def lqg_solved():
         (1.5, -1.0),
         (-2.0, -2.0),
         (0.0, 0.0),
+        # Opposite-sign corners — exposes the upper-edge boundary artifact
+        # when the state range is too narrow (the optimal next-state pushes
+        # past the grid edge under positive shocks).
+        (2.5, -2.5),
+        (-2.5, 2.5),
     ],
 )
 def test_lqg_value_matches_riccati(lqg_solved, x_pair):
@@ -155,9 +160,10 @@ def test_lqg_value_matches_riccati(lqg_solved, x_pair):
     v_bg = lqg_solved["value"](state_q, t=0).item()
 
     # Quadratic V means multilinear interp has an O(h^2) bias that
-    # accumulates across the T backward sweeps; tolerance reflects that
-    # residual at n=129 per state, T=15.
-    assert v_bg == pytest.approx(v_closed, rel=0.05, abs=0.05), (
+    # accumulates across the T backward sweeps. At range=(-5, 5) with
+    # n=129 the grid spacing h ≈ 0.078, so per-step bias is roughly
+    # 1.5x what it was at range=(-3, 3) with the same n.
+    assert v_bg == pytest.approx(v_closed, rel=0.05, abs=0.1), (
         f"x={x_pair}: bellgrid V = {v_bg:.4f}, riccati V = {v_closed:.4f}"
     )
 
@@ -233,7 +239,7 @@ def test_lqg_print_convergence_sweep():
             max_v_err = max(max_v_err, abs(v_bg - v_closed))
             max_u_err = max(max_u_err, abs(u_bg - u_closed))
 
-        h = 6.0 / (n - 1)
+        h = 10.0 / (n - 1)
         ratio = f"{prev_v_err / max_v_err:.2f}x" if prev_v_err is not None else "—"
         print(f"{n:>10d} {h:>8.4f} {max_v_err:>14.4e} {max_u_err:>14.4e}"
               f" {ratio:>10}")
@@ -291,5 +297,5 @@ def test_lqg_print_comparison_table(lqg_solved):
     print(f"Max |Δ V| = {max_v_err:.4e}   Max |Δ u| = {max_u_err:.4e}")
     print()
 
-    assert max_v_err < 0.1
+    assert max_v_err < 0.2
     assert max_u_err < 0.15

@@ -134,10 +134,17 @@ def terminal_reward(state):
     return -(state["x1"]**2 + state["x2"]**2)
 
 
+# Important: the state range must extend well past where we'll query.
+# Under our dynamics, the optimal trajectory from a point like (-2.5, +2.5)
+# crosses next_x2 ≈ 2.4 (close to the grid edge), and the GH shock nodes
+# push it over. Clamp-at-edge interpolation then underestimates V at the
+# opposite-sign corners by O(1) — exactly the kind of artifact we want to
+# rule out. range=(-5, 5) puts the query region at ~50% of the grid so the
+# boundary stays out of the way.
 problem = Problem(
     states=[
-        ContinuousState("x1", range=(-3.0, 3.0)),
-        ContinuousState("x2", range=(-3.0, 3.0)),
+        ContinuousState("x1", range=(-5.0, 5.0)),
+        ContinuousState("x2", range=(-5.0, 5.0)),
     ],
     actions=[ContinuousAction("u", bounds=(-5.0, 5.0))],
     transition=transition,
@@ -347,7 +354,7 @@ def max_v_err(n):
 
 
 ns = [33, 65, 129]
-hs = [6.0 / (n - 1) for n in ns]
+hs = [10.0 / (n - 1) for n in ns]
 errs = [max_v_err(n) for n in ns]
 
 for n, h, e in zip(ns, hs, errs):
