@@ -118,69 +118,7 @@ policy, value = solve(
 
 
 # %% [markdown]
-# ## Kinked consumption function
-#
-# At low cash the constraint $c \le m$ binds and the household consumes
-# essentially all of it (red dashed 45° line). Above the buffer-stock
-# threshold the household saves and the curve bends away from the 45°
-# line. The kink is the headline qualitative feature of the model.
-
-# %%
-cash_query = torch.linspace(0.5, 18.0, 200, dtype=torch.float64)
-consume = policy({"cash": cash_query}, t=T // 2)["consume"].numpy()
-cash_np = cash_query.numpy()
-
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
-ax1.plot(cash_np, consume, lw=2.5, label="bellgrid policy $c^*(m)$")
-ax1.plot(cash_np, cash_np, ls="--", color="C3", lw=1.5,
-         label="constraint $c = m$ (no borrowing)")
-ax1.set_xlabel("cash-on-hand $m$")
-ax1.set_ylabel("consumption $c^*$")
-ax1.set_title("Consumption function (mid-horizon)")
-ax1.legend()
-ax1.grid(alpha=0.3)
-
-ax2.plot(cash_np, consume / cash_np, lw=2.5)
-ax2.axhline(1.0, color="C3", ls="--", lw=1.5, label="$c/m = 1$ (constraint binds)")
-ax2.set_xlabel("cash-on-hand $m$")
-ax2.set_ylabel("consumption rate $c^* / m$")
-ax2.set_title("Consumption rate (showing the buffer-stock target)")
-ax2.legend()
-ax2.grid(alpha=0.3)
-plt.tight_layout()
-plt.show()
-
-
-# %% [markdown]
-# ## Marginal propensity to consume
-#
-# $\mathrm{MPC}(m) = \partial c^*(m)/\partial m$. Approaches 1 at low cash
-# (constraint binding) and drops below 0.5 quickly. Standard calibrations
-# in the literature report MPC in the 0.2 – 0.5 range at typical wealth
-# levels.
-
-# %%
-h = 0.05
-cash_mpc = torch.linspace(0.6, 18.0, 300, dtype=torch.float64)
-c_plus = policy({"cash": cash_mpc + h}, t=T // 2)["consume"]
-c_minus = policy({"cash": cash_mpc - h}, t=T // 2)["consume"]
-mpc = ((c_plus - c_minus) / (2 * h)).numpy()
-
-fig, ax = plt.subplots(figsize=(7, 4))
-ax.plot(cash_mpc.numpy(), mpc, lw=2.5)
-ax.axhline(1.0, color="C3", ls="--", lw=1.5, label="MPC = 1 (constrained)")
-ax.set_xlabel("cash-on-hand $m$")
-ax.set_ylabel("MPC")
-ax.set_title("Marginal propensity to consume")
-ax.set_ylim(-0.05, 1.1)
-ax.legend()
-ax.grid(alpha=0.3)
-plt.tight_layout()
-plt.show()
-
-
-# %% [markdown]
-# ## Cross-validation: Endogenous Grid Method (Carroll 2006)
+# ## Reference: Endogenous Grid Method (Carroll 2006)
 #
 # Carroll/Deaton has no closed form. The canonical numerical benchmark is
 # the **endogenous grid method**: instead of gridding cash-on-hand and
@@ -195,26 +133,21 @@ plt.show()
 # $$ m_t^*(a) = c_t^*(a) + a. $$
 #
 # That gives an *endogenous* grid of $(m_t, c_t)$ pairs from which the
-# consumption function is interpolated. The borrowing constraint is
-# baked in by the fact that $a = 0$ produces $m_t = c_t$ — below that
-# threshold the constraint binds and $c = m$.
-#
-# EGM is the de facto reference for this problem class. If bellgrid is
-# computing the right thing, the two consumption functions should overlap
-# tightly.
+# consumption function is interpolated. The borrowing constraint is baked
+# in: $a = 0$ produces $m_t = c_t$, and below that threshold the agent
+# consumes all of cash. EGM is the de facto reference for this problem
+# class — independent of bellgrid's grid-on-cash approach, so the two
+# should overlap tightly if both are right.
 
 # %%
 def egm_carroll_deaton(gamma, R, beta, mu_y, sigma_y, T, n_a=400, a_max=30.0, n_quad=7):
     """Endogenous Grid Method for Carroll/Deaton with i.i.d. Normal income."""
-    # Income shock quadrature (GH on the standard normal, scaled)
     raw_z, raw_w = np.polynomial.hermite_e.hermegauss(n_quad)
     w_quad = raw_w / np.sqrt(2 * np.pi)
     y_nodes = mu_y + sigma_y * raw_z
 
-    # Post-decision wealth grid, denser near zero
     a_grid = np.geomspace(1e-4, a_max, n_a)
 
-    # Terminal policy: c_T(m) = m (consume all at expiry).
     m_endo = np.linspace(0.0, 50.0, 500)
     c_endo = m_endo.copy()
 
@@ -226,19 +159,14 @@ def egm_carroll_deaton(gamma, R, beta, mu_y, sigma_y, T, n_a=400, a_max=30.0, n_
         m_implied = np.zeros(n_a)
         c_implied = np.zeros(n_a)
         for i, a in enumerate(a_grid):
-            # Next-period m under each shock realization
-            m_realizations = R * a + y_nodes  # shape (n_quad,)
-            # Interpolate next-period consumption (flat extrapolation past edges)
+            m_realizations = R * a + y_nodes
             c_realizations = np.interp(m_realizations, m_next, c_next)
-            # u'(c) = c^(-gamma), then expected marginal utility
             E_up_next = (w_quad * c_realizations ** (-gamma)).sum()
             c_t = (beta * R * E_up_next) ** (-1.0 / gamma)
             m_implied[i] = c_t + a
             c_implied[i] = c_t
 
-        # Prepend (0, 0) so linear interp gives c = m in the constraint region
-        # (at a = 0 we have c = m, and below that threshold the agent is
-        # constrained and consumes all of cash).
+        # Prepend (0, 0) so linear interp recovers c = m in the constraint region.
         m_full = np.concatenate(([0.0], m_implied))
         c_full = np.concatenate(([0.0], np.minimum(c_implied, m_implied)))
         policies[t] = (m_full, c_full)
@@ -253,25 +181,74 @@ def egm_consumption(policies, t, m_query):
 
 
 egm_policies = egm_carroll_deaton(gamma, R, beta, mu_y, sigma_y, T)
-c_egm = egm_consumption(egm_policies, T // 2, cash_np)
+
+
+# %% [markdown]
+# ## Consumption function
+#
+# At low cash the no-borrowing constraint $c \le m$ binds and the
+# household consumes essentially all of it (45° line). Above the
+# buffer-stock threshold the household saves and the curve bends
+# away. Bellgrid and EGM overlap visually; the residual plot shows
+# the actual agreement.
+
+# %%
+cash_np = np.linspace(0.5, 18.0, 200)
+consume_bg = policy(
+    {"cash": torch.tensor(cash_np, dtype=torch.float64)}, t=T // 2
+)["consume"].numpy()
+consume_eg = egm_consumption(egm_policies, T // 2, cash_np)
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
-ax1.plot(cash_np, consume, lw=2.5, label="bellgrid")
-ax1.plot(cash_np, c_egm, ls="--", lw=2, label="EGM (Carroll 2006)")
-ax1.plot(cash_np, cash_np, color="C3", lw=1, alpha=0.5, label="constraint $c = m$")
+ax1.plot(cash_np, consume_bg, lw=2.5, label="bellgrid")
+ax1.plot(cash_np, consume_eg, ls="--", lw=2, color="C1", label="EGM (Carroll 2006)")
+ax1.plot(cash_np, cash_np, color="C3", lw=1, alpha=0.6, label="constraint $c = m$")
 ax1.set_xlabel("cash-on-hand $m$")
 ax1.set_ylabel("consumption $c^*$")
-ax1.set_title("Consumption function: bellgrid vs EGM (mid-horizon)")
+ax1.set_title("Consumption function (mid-horizon)")
 ax1.legend()
 ax1.grid(alpha=0.3)
 
-residual = consume - c_egm
+residual = consume_bg - consume_eg
 ax2.plot(cash_np, residual, lw=2, color="C2")
 ax2.axhline(0.0, color="black", lw=0.5)
 ax2.set_xlabel("cash-on-hand $m$")
 ax2.set_ylabel("$c_{bellgrid} - c_{EGM}$")
-ax2.set_title(f"Residual (max |Δ| = {np.abs(residual).max():.2e})")
+ax2.set_title(f"Residual  (max |Δ| = {np.abs(residual).max():.2e})")
 ax2.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# %% [markdown]
+# ## Marginal propensity to consume
+#
+# $\mathrm{MPC}(m) = \partial c^*(m)/\partial m$. We compute the
+# numerical derivative on a moderately coarse sample (≈0.3 spacing) so
+# the underlying piecewise-linear grid segments average out cleanly.
+# Approaches 1 at low cash (constraint binding) and drops below 0.5
+# quickly. Standard calibrations in the literature report MPC in the
+# 0.2 – 0.5 range at typical wealth levels.
+
+# %%
+cash_mpc = np.linspace(0.5, 18.0, 60)
+c_bg_mpc = policy(
+    {"cash": torch.tensor(cash_mpc, dtype=torch.float64)}, t=T // 2
+)["consume"].numpy()
+c_eg_mpc = egm_consumption(egm_policies, T // 2, cash_mpc)
+mpc_bg = np.gradient(c_bg_mpc, cash_mpc)
+mpc_eg = np.gradient(c_eg_mpc, cash_mpc)
+
+fig, ax = plt.subplots(figsize=(8, 4.5))
+ax.plot(cash_mpc, mpc_bg, lw=2.5, label="bellgrid")
+ax.plot(cash_mpc, mpc_eg, ls="--", lw=2, color="C1", label="EGM")
+ax.axhline(1.0, color="C3", ls="--", lw=1.0, alpha=0.6, label="MPC = 1 (constrained)")
+ax.set_xlabel("cash-on-hand $m$")
+ax.set_ylabel("MPC")
+ax.set_ylim(-0.05, 1.1)
+ax.set_title("Marginal propensity to consume")
+ax.legend()
+ax.grid(alpha=0.3)
 plt.tight_layout()
 plt.show()
 
