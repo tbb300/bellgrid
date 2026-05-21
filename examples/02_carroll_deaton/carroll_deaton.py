@@ -87,6 +87,17 @@ def reward(_state, action, _shock, _t):
     return (c ** (1.0 - gamma)) / (1.0 - gamma)
 
 
+def terminal_reward(state):
+    # Natural finite-horizon convention: the agent consumes everything
+    # remaining at expiry, so V_T(m) = u(m). Without this the agent has
+    # no reason to save in the final period, which warps the entire
+    # backward sweep and prevents an apples-to-apples comparison with EGM.
+    c = state["cash"]
+    if gamma == 1.0:
+        return torch.log(c)
+    return (c ** (1.0 - gamma)) / (1.0 - gamma)
+
+
 problem = Problem(
     states=[ContinuousState("cash", warp="asinh", range=(0.5, 20.0))],
     actions=[ContinuousAction("consume", bounds=(1e-4, "cash"))],
@@ -95,6 +106,7 @@ problem = Problem(
     shocks=[Normal("z", sigma=1.0)],
     horizon=range(0, T),
     discount=beta,
+    terminal_reward=terminal_reward,
 )
 
 policy, value = solve(
@@ -168,6 +180,103 @@ plt.show()
 
 
 # %% [markdown]
+# ## Cross-validation: Endogenous Grid Method (Carroll 2006)
+#
+# Carroll/Deaton has no closed form. The canonical numerical benchmark is
+# the **endogenous grid method**: instead of gridding cash-on-hand and
+# searching for the optimal action at each point, you grid the
+# **post-decision wealth** $a = m - c$ and use the Euler equation to
+# back out the implied consumption at each $a$.
+#
+# At each $t$, for every post-decision $a$:
+#
+# $$ c_t^*(a) = \Bigl(\,\beta R\,\mathbb{E}\bigl[u'(c_{t+1}(R a + y))\bigr]\,\Bigr)^{-1/\gamma}, $$
+#
+# $$ m_t^*(a) = c_t^*(a) + a. $$
+#
+# That gives an *endogenous* grid of $(m_t, c_t)$ pairs from which the
+# consumption function is interpolated. The borrowing constraint is
+# baked in by the fact that $a = 0$ produces $m_t = c_t$ — below that
+# threshold the constraint binds and $c = m$.
+#
+# EGM is the de facto reference for this problem class. If bellgrid is
+# computing the right thing, the two consumption functions should overlap
+# tightly.
+
+# %%
+def egm_carroll_deaton(gamma, R, beta, mu_y, sigma_y, T, n_a=400, a_max=30.0, n_quad=7):
+    """Endogenous Grid Method for Carroll/Deaton with i.i.d. Normal income."""
+    # Income shock quadrature (GH on the standard normal, scaled)
+    raw_z, raw_w = np.polynomial.hermite_e.hermegauss(n_quad)
+    w_quad = raw_w / np.sqrt(2 * np.pi)
+    y_nodes = mu_y + sigma_y * raw_z
+
+    # Post-decision wealth grid, denser near zero
+    a_grid = np.geomspace(1e-4, a_max, n_a)
+
+    # Terminal policy: c_T(m) = m (consume all at expiry).
+    m_endo = np.linspace(0.0, 50.0, 500)
+    c_endo = m_endo.copy()
+
+    policies = [None] * (T + 1)
+    policies[T] = (m_endo, c_endo)
+
+    for t in range(T - 1, -1, -1):
+        m_next, c_next = policies[t + 1]
+        m_implied = np.zeros(n_a)
+        c_implied = np.zeros(n_a)
+        for i, a in enumerate(a_grid):
+            # Next-period m under each shock realization
+            m_realizations = R * a + y_nodes  # shape (n_quad,)
+            # Interpolate next-period consumption (flat extrapolation past edges)
+            c_realizations = np.interp(m_realizations, m_next, c_next)
+            # u'(c) = c^(-gamma), then expected marginal utility
+            E_up_next = (w_quad * c_realizations ** (-gamma)).sum()
+            c_t = (beta * R * E_up_next) ** (-1.0 / gamma)
+            m_implied[i] = c_t + a
+            c_implied[i] = c_t
+
+        # Prepend (0, 0) so linear interp gives c = m in the constraint region
+        # (at a = 0 we have c = m, and below that threshold the agent is
+        # constrained and consumes all of cash).
+        m_full = np.concatenate(([0.0], m_implied))
+        c_full = np.concatenate(([0.0], np.minimum(c_implied, m_implied)))
+        policies[t] = (m_full, c_full)
+
+    return policies
+
+
+def egm_consumption(policies, t, m_query):
+    m_endo, c_endo = policies[t]
+    c = np.interp(m_query, m_endo, c_endo)
+    return np.minimum(c, m_query)
+
+
+egm_policies = egm_carroll_deaton(gamma, R, beta, mu_y, sigma_y, T)
+c_egm = egm_consumption(egm_policies, T // 2, cash_np)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4.5))
+ax1.plot(cash_np, consume, lw=2.5, label="bellgrid")
+ax1.plot(cash_np, c_egm, ls="--", lw=2, label="EGM (Carroll 2006)")
+ax1.plot(cash_np, cash_np, color="C3", lw=1, alpha=0.5, label="constraint $c = m$")
+ax1.set_xlabel("cash-on-hand $m$")
+ax1.set_ylabel("consumption $c^*$")
+ax1.set_title("Consumption function: bellgrid vs EGM (mid-horizon)")
+ax1.legend()
+ax1.grid(alpha=0.3)
+
+residual = consume - c_egm
+ax2.plot(cash_np, residual, lw=2, color="C2")
+ax2.axhline(0.0, color="black", lw=0.5)
+ax2.set_xlabel("cash-on-hand $m$")
+ax2.set_ylabel("$c_{bellgrid} - c_{EGM}$")
+ax2.set_title(f"Residual (max |Δ| = {np.abs(residual).max():.2e})")
+ax2.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+
+# %% [markdown]
 # ## Forward simulation: buffer-stock dynamics
 #
 # Starting from cash near the constraint, the household accumulates a
@@ -184,6 +293,7 @@ problem_long = Problem(
     shocks=problem.shocks,
     horizon=range(0, T_long),
     discount=beta,
+    terminal_reward=terminal_reward,
 )
 policy_long, _ = solve(
     problem_long,
