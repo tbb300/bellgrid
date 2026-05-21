@@ -188,7 +188,7 @@ policy, value = solve(
                 "basis_fraction": RegularGrid(n=16)},
     action_grid={"draw": RegularGrid(n=64),
                  "equity_share": RegularGrid(n=33)},
-    solver=BackwardInduction(),         # PolicyIteration(tol=1e-7) for horizon=None is planned
+    solver=BackwardInduction(),         # or PolicyIteration(tol=1e-7) for horizon=None
     device="cuda",
     dtype="float64",                    # float32 is faster but risky for wide-range value funcs or -inf rewards (NaN risk)
     chunk_size=2**20,                   # batch size for Bellman expectation; lower if OOM
@@ -199,7 +199,7 @@ policy, value = solve(
 
 `chunk_size` controls the batch size for evaluating the Bellman expectation — the joint grid of states × shock quadrature nodes is processed in chunks of this size. Lower it if you OOM; raise it for throughput on large devices.
 
-Defaults and required arguments: `state_grid` is required when there are continuous states; `action_grid` when there are continuous actions; `solver` has no default (pass `BackwardInduction()` for finite horizon; `PolicyIteration(tol=...)` for `horizon=None` is planned). The remaining arguments default to `device="cuda" if available else "cpu"`, `dtype="float64"`, `chunk_size=2**20` (the latter is currently accepted but unused — it'll matter once memory-chunked Bellman updates land).
+Defaults and required arguments: `state_grid` is required when there are continuous states; `action_grid` when there are continuous actions; `solver` has no default (pass `BackwardInduction()` for finite horizon or `PolicyIteration(tol=...)` for `horizon=None`). `PolicyIteration` iterates the Bellman operator to convergence (value iteration under the hood — the name matches the historical API spec); convergence rate is geometric in the discount factor, so γ=0.96 typically takes ~300 iterations to hit `tol=1e-6`. The remaining arguments default to `device="cuda" if available else "cpu"`, `dtype="float64"`, `chunk_size=2**20` (the latter is currently accepted but unused — it'll matter once memory-chunked Bellman updates land).
 
 `policy(state, t)` and `value(state, t)` are time-indexed for finite-horizon problems — the solver stores a separate V and π slice at each `t` in `horizon`. Pass `t=None` for infinite-horizon problems, where V and π are stationary. Both accept batched state dicts (equal-shaped tensors) and return batched actions and values; scalar dicts work too for one-off queries.
 

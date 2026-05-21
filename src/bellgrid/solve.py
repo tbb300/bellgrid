@@ -4,6 +4,7 @@ import torch
 
 from .problem import Problem
 from .solvers.backward_induction import BackwardInduction, _backward_induction
+from .solvers.policy_iteration import PolicyIteration, _policy_iteration
 
 
 def solve(
@@ -21,7 +22,8 @@ def solve(
     `policy(state, t)` returns a dict of action values; `value(state, t)`
     returns the value-function scalar. Both interpolate from the per-`t`
     grid arrays produced by the solver and return tensors on the same
-    device as the queried state.
+    device as the queried state. For ``PolicyIteration`` (infinite
+    horizon) the value/policy are stationary — pass ``t=None``.
 
     ``device=None`` (default) picks CUDA if available, else CPU.
     """
@@ -29,12 +31,12 @@ def solve(
         device = "cuda" if torch.cuda.is_available() else "cpu"
     if isinstance(solver, BackwardInduction):
         return _backward_induction(
-            problem,
-            state_grid,
-            action_grid,
-            solver,
-            device=device,
-            dtype=dtype,
-            chunk_size=chunk_size,
+            problem, state_grid, action_grid, solver,
+            device=device, dtype=dtype, chunk_size=chunk_size,
+        )
+    if isinstance(solver, PolicyIteration):
+        return _policy_iteration(
+            problem, state_grid, action_grid, solver,
+            device=device, dtype=dtype, chunk_size=chunk_size,
         )
     raise TypeError(f"unknown solver: {type(solver).__name__}")

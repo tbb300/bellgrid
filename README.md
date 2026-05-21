@@ -80,12 +80,11 @@ Each notebook opens with the problem statement and equations, then runs bellgrid
 - **Actions**: `ContinuousAction` (with optional state-dependent bounds), `DiscreteAction`.
 - **Shocks**: `Normal`, `Lognormal`, `MultivariateNormal`, `Jump` (Bernoulli-approximated Poisson with Normal log-magnitudes) — all with Gauss-Hermite quadrature. Multiple independent shocks per problem are supported via tensor-product quadrature.
 - **Grids**: `RegularGrid`, `WarpedGrid`.
-- **Solver**: `BackwardInduction` for finite horizon, CPU or CUDA, JIT-compiled K-D multilinear interpolation.
+- **Solvers**: `BackwardInduction` for finite-horizon problems, `PolicyIteration` (value iteration under the hood) for infinite-horizon stationary problems. CPU or CUDA, JIT-compiled K-D multilinear interpolation.
 - **Simulator**: `simulate()` shares the user's `transition` and `reward` with the solver, so they can't drift apart.
 
 ## Planned
 
-- `PolicyIteration` solver — infinite-horizon problems (removes the truncate-with-closed-form-terminal hack).
 - Implicit differentiation of `policy` / `value` wrt model parameters.
 - Local action search instead of grid enumeration (for problems with many continuous actions).
 
