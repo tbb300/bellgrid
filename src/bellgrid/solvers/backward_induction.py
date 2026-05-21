@@ -12,11 +12,12 @@ import torch
 
 from ..grids.regular import RegularGrid
 from ..interpolation.multilinear import multilinear
-from ..problem import ContinuousAction, ContinuousState, Problem
+from ..problem import ContinuousAction, ContinuousState, DiscreteAction, Problem
 from ..shocks.lognormal import Lognormal
 from ..shocks.normal import Normal
 
 _SUPPORTED_SHOCKS = (Normal, Lognormal)
+_SUPPORTED_ACTIONS = (ContinuousAction, DiscreteAction)
 
 
 @dataclass(frozen=True)
@@ -33,7 +34,12 @@ class BackwardInduction:
 
 
 class _Policy:
-    """Callable wrapping the time-indexed optimal action arrays."""
+    """Callable wrapping the time-indexed optimal action arrays.
+
+    Continuous actions are interpolated multilinearly in the warped state
+    coordinate. Discrete actions return the optimal index at the nearest
+    state grid point (linear interp on integer indices isn't meaningful).
+    """
 
     def __init__(
         self,
@@ -41,19 +47,38 @@ class _Policy:
         u_pts: torch.Tensor,
         transform: Callable[[torch.Tensor], torch.Tensor],
         policy_by_t: dict,
+        action_kinds: dict,
     ) -> None:
         self._state_name = state_name
         self._u_pts = u_pts
         self._transform = transform
         self._policy_by_t = policy_by_t
+        self._action_kinds = action_kinds
 
     def __call__(self, state: dict, t):
         s = torch.as_tensor(state[self._state_name], dtype=self._u_pts.dtype)
         u = self._transform(s)
-        return {
-            name: multilinear([self._u_pts], arr, [u])
-            for name, arr in self._policy_by_t[t].items()
-        }
+        result = {}
+        for name, arr in self._policy_by_t[t].items():
+            if self._action_kinds[name] == "discrete":
+                result[name] = _nearest_neighbor(self._u_pts, arr, u)
+            else:
+                result[name] = multilinear([self._u_pts], arr, [u])
+        return result
+
+
+def _nearest_neighbor(
+    u_pts: torch.Tensor, values: torch.Tensor, query: torch.Tensor
+) -> torch.Tensor:
+    """Look up `values` at the grid index closest (in u-space) to each query."""
+    idx = torch.searchsorted(u_pts, query, right=False)
+    idx = torch.clamp(idx, 1, u_pts.numel() - 1)
+    left = idx - 1
+    right = idx
+    d_left = (query - u_pts[left]).abs()
+    d_right = (u_pts[right] - query).abs()
+    closer = torch.where(d_left <= d_right, left, right)
+    return values[closer]
 
 
 class _Value:
@@ -94,11 +119,13 @@ def _backward_induction(
             f"tracer supports exactly one ContinuousState (and no other state "
             f"types); got {len(problem.states)} state(s)"
         )
-    cont_actions = [a for a in problem.actions if isinstance(a, ContinuousAction)]
-    if len(cont_actions) != len(problem.actions):
-        raise NotImplementedError("tracer supports only ContinuousAction")
-    if len(cont_actions) == 0:
+    if any(not isinstance(a, _SUPPORTED_ACTIONS) for a in problem.actions):
+        raise NotImplementedError(
+            f"tracer supports only {[c.__name__ for c in _SUPPORTED_ACTIONS]}"
+        )
+    if len(problem.actions) == 0:
         raise ValueError("Problem has no actions")
+    cont_actions = [a for a in problem.actions if isinstance(a, ContinuousAction)]
 
     supported = [s for s in problem.shocks if isinstance(s, _SUPPORTED_SHOCKS)]
     if len(supported) != len(problem.shocks):
@@ -142,44 +169,61 @@ def _backward_induction(
     def _to_u(x: torch.Tensor) -> torch.Tensor:
         return grid_spec.transform_for_interp(x, warp=state.warp)
 
-    # ---- build action grids (cartesian product on normalized [0, 1]) ---
+    # ---- build joint action grid -------------------------------------
+    # Continuous actions live on normalized [0,1] grids (rescaled to bounds,
+    # possibly state-dependent). Discrete actions enumerate their integer
+    # values. The cartesian product is computed over indices, then per-action
+    # values are gathered at each combo.
     for action in cont_actions:
         if action.name not in action_grid:
             raise ValueError(
                 f"action_grid missing entry for action {action.name!r}"
             )
 
-    action_axes = [
-        action_grid[a.name].points(0.0, 1.0, dtype=dtype, device=device)
-        for a in cont_actions
+    action_sizes = []
+    for a in problem.actions:
+        if isinstance(a, ContinuousAction):
+            action_sizes.append(action_grid[a.name].n)
+        else:  # DiscreteAction
+            action_sizes.append(a.n)
+    N_a = 1
+    for sz in action_sizes:
+        N_a *= sz
+
+    index_axes = [
+        torch.arange(sz, dtype=torch.long, device=device) for sz in action_sizes
     ]
-    mesh = torch.meshgrid(*action_axes, indexing="ij")
-    action_normalized = {
-        a.name: m.reshape(-1) for a, m in zip(cont_actions, mesh)
-    }
-    N_a = next(iter(action_normalized.values())).numel()
+    index_mesh = torch.meshgrid(*index_axes, indexing="ij")
+    index_flat = [m.reshape(-1) for m in index_mesh]  # K tensors of shape (N_a,)
 
-    # Rescale to actual bounds. State-dependent upper/lower become (N_s, N_a).
+    def _resolve_bound(b):
+        if isinstance(b, str):
+            if b == state_name:
+                return s_pts.unsqueeze(-1)  # (N_s, 1)
+            raise NotImplementedError(
+                f"action bound reference to {b!r}: only the single "
+                f"declared state is supported in the tracer"
+            )
+        return torch.as_tensor(float(b), dtype=dtype, device=device)
+
     action_tensors: dict[str, torch.Tensor] = {}
-    for action in cont_actions:
-        norm = action_normalized[action.name]  # (N_a,)
-
-        def _resolve(b):
-            if isinstance(b, str):
-                if b == state_name:
-                    return s_pts.unsqueeze(-1)  # (N_s, 1)
-                raise NotImplementedError(
-                    f"action bound reference to {b!r}: only the single "
-                    f"declared state is supported in the tracer"
-                )
-            return torch.as_tensor(float(b), dtype=dtype, device=device)
-
-        lo = _resolve(action.bounds[0])
-        hi = _resolve(action.bounds[1])
-        a = lo + (hi - lo) * norm  # broadcasts to (N_s, N_a) or (N_a,)
-        if a.ndim == 1:
-            a = a.unsqueeze(0).expand(N_s, -1)
-        action_tensors[action.name] = a.contiguous()
+    action_kinds: dict[str, str] = {}
+    for a, idx in zip(problem.actions, index_flat):
+        if isinstance(a, ContinuousAction):
+            norm_grid = action_grid[a.name].points(
+                0.0, 1.0, dtype=dtype, device=device
+            )
+            norm = norm_grid[idx]  # (N_a,)
+            lo = _resolve_bound(a.bounds[0])
+            hi = _resolve_bound(a.bounds[1])
+            val = lo + (hi - lo) * norm
+            if val.ndim == 1:
+                val = val.unsqueeze(0).expand(N_s, -1)
+            action_tensors[a.name] = val.contiguous()
+            action_kinds[a.name] = "continuous"
+        else:  # DiscreteAction
+            action_tensors[a.name] = idx.unsqueeze(0).expand(N_s, -1).contiguous()
+            action_kinds[a.name] = "discrete"
 
     # ---- shock quadrature ----------------------------------------------
     if supported:
@@ -256,6 +300,6 @@ def _backward_induction(
         V_next = V_now
 
     return (
-        _Policy(state_name, u_pts, _to_u, policy_by_t),
+        _Policy(state_name, u_pts, _to_u, policy_by_t, action_kinds),
         _Value(state_name, u_pts, _to_u, V_by_t),
     )

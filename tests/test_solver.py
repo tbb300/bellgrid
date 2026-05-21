@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from bellgrid import ContinuousAction, ContinuousState, Problem, solve
+from bellgrid import ContinuousAction, ContinuousState, DiscreteAction, Problem, solve
 from bellgrid.grids import RegularGrid
 from bellgrid.solvers import BackwardInduction
 
@@ -146,6 +146,79 @@ def test_solver_runs_with_warped_grid():
     assert torch.allclose(v, w, rtol=0.05)
     assert (a["consume"] >= 0).all()
     assert (a["consume"] <= w + 1e-9).all()
+
+
+def test_solver_runs_with_discrete_action():
+    """DiscreteAction enumerates its n values; the solver returns long-dtype
+    optimal actions and nearest-neighbor interpolates them at queries."""
+
+    def transition(state, action, shock, t):
+        # The discrete action doesn't affect dynamics in this trivial setup
+        return {"wealth": state["wealth"] - 0.1}
+
+    def reward(state, action, shock, t):
+        # Reward is the chosen action's index — argmax picks index n-1
+        return action["choice"].to(state["wealth"].dtype)
+
+    problem = Problem(
+        states=[ContinuousState("wealth", range=(0.0, 10.0))],
+        actions=[DiscreteAction("choice", n=3)],
+        transition=transition,
+        reward=reward,
+        shocks=[],
+        horizon=range(0, 2),
+        discount=1.0,
+    )
+
+    policy, value = solve(
+        problem,
+        state_grid={"wealth": RegularGrid(n=20)},
+        action_grid={},  # no continuous actions
+        solver=BackwardInduction(),
+    )
+
+    w = torch.tensor([1.0, 5.0, 9.0], dtype=torch.float64)
+    a = policy({"wealth": w}, t=0)
+    # Reward = action_index, so argmax picks index 2 at every state
+    assert a["choice"].dtype == torch.long
+    assert (a["choice"] == 2).all()
+
+
+def test_solver_runs_with_mixed_continuous_and_discrete_actions():
+    """Continuous + discrete actions compose."""
+
+    def transition(state, action, shock, t):
+        return {"wealth": state["wealth"] - action["consume"]}
+
+    def reward(state, action, shock, t):
+        # Reward = consume + (1 if flag else 0)
+        return action["consume"] + action["flag"].to(state["wealth"].dtype)
+
+    problem = Problem(
+        states=[ContinuousState("wealth", range=(0.0, 10.0))],
+        actions=[
+            ContinuousAction("consume", bounds=(0.0, "wealth")),
+            DiscreteAction("flag", n=2),
+        ],
+        transition=transition,
+        reward=reward,
+        shocks=[],
+        horizon=range(0, 1),
+        discount=1.0,
+    )
+
+    policy, _ = solve(
+        problem,
+        state_grid={"wealth": RegularGrid(n=30)},
+        action_grid={"consume": RegularGrid(n=50)},
+        solver=BackwardInduction(),
+    )
+
+    w = torch.tensor([5.0], dtype=torch.float64)
+    a = policy({"wealth": w}, t=0)
+    # Optimal: flag=1 always (extra +1 reward), consume=wealth (linear reward)
+    assert a["flag"].item() == 1
+    assert a["consume"].item() == pytest.approx(5.0, rel=0.05)
 
 
 def test_solver_runs_with_normal_shock():

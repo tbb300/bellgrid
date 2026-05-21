@@ -24,6 +24,22 @@ class ContinuousAction:
 
 
 @dataclass(frozen=True)
+class DiscreteAction:
+    name: str
+    n: int
+    labels: Optional[tuple] = None  # human-readable labels for each category
+
+    def __post_init__(self):
+        if self.n < 1:
+            raise ValueError(f"DiscreteAction requires n >= 1, got {self.n}")
+        if self.labels is not None and len(self.labels) != self.n:
+            raise ValueError(
+                f"DiscreteAction labels must have length n={self.n}, "
+                f"got {len(self.labels)}"
+            )
+
+
+@dataclass(frozen=True)
 class Problem:
     states: list
     actions: list
