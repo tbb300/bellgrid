@@ -10,9 +10,11 @@ or run the source `.py` files directly.
 - `02_carroll_deaton/carroll_deaton.ipynb` — CRRA lifecycle savings with
   a borrowing constraint; shows the kinked consumption function and the
   buffer-stock target.
-- `03_american_option/` — README only; the test in `tests/test_american_option.py`
-  validates against a CRR binomial reference and prints the early-exercise
-  premium across spot. A notebook variant is on the roadmap.
+- `03_american_option/american_option.ipynb` — American put under
+  risk-neutral GBM, validated against a high-resolution CRR binomial
+  tree and the Black-Scholes European put. Shows the early-exercise
+  premium, the optimal exercise boundary $S^*(t)$ across time, and a
+  spot sweep table.
 - `04_lqg/lqg.ipynb` — 2-D LQR + Gaussian noise, validated against the
   closed-form discrete-time Riccati recursion. Heatmaps and slices of
   $V_0(x)$ and $u^*_0(x)$ side-by-side.
