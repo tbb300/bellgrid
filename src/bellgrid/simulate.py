@@ -28,7 +28,7 @@ def simulate(
     initial_state: dict,
     seed: Optional[int] = None,
     dtype: torch.dtype = torch.float64,
-    device: str | torch.device = "cpu",
+    device: str | torch.device | None = None,
 ) -> dict:
     """Simulate ``n`` forward paths under ``policy``.
 
@@ -76,6 +76,9 @@ def simulate(
         raise NotImplementedError("simulate does not support infinite horizon yet")
     if callable(problem.discount):
         raise NotImplementedError("simulate does not support callable discount yet")
+
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
 
     horizon = list(problem.horizon)
     T = len(horizon)

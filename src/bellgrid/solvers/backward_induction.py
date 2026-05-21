@@ -63,8 +63,11 @@ class _Policy:
         self._action_kinds = action_kinds
 
     def __call__(self, state: dict, t):
+        target_device = _query_device(state[self._state_names[0]])
         u_queries = [
-            transform(torch.as_tensor(state[name], dtype=u.dtype))
+            transform(
+                torch.as_tensor(state[name], dtype=u.dtype, device=u.device)
+            )
             for name, u, transform in zip(
                 self._state_names, self._u_pts_list, self._transforms
             )
@@ -76,12 +79,20 @@ class _Policy:
                     raise NotImplementedError(
                         "discrete-action lookup currently supports K=1 only"
                     )
-                result[name] = _nearest_neighbor(
+                out = _nearest_neighbor(
                     self._u_pts_list[0], arr, u_queries[0]
                 )
             else:
-                result[name] = multilinear(self._u_pts_list, arr, u_queries)
+                out = multilinear(self._u_pts_list, arr, u_queries)
+            result[name] = out.to(target_device)
         return result
+
+
+def _query_device(sample) -> torch.device:
+    """Pick the device to return results on, matching the queried state."""
+    if isinstance(sample, torch.Tensor):
+        return sample.device
+    return torch.device("cpu")
 
 
 def _nearest_neighbor(
@@ -114,13 +125,17 @@ class _Value:
         self._V_by_t = V_by_t
 
     def __call__(self, state: dict, t):
+        target_device = _query_device(state[self._state_names[0]])
         u_queries = [
-            transform(torch.as_tensor(state[name], dtype=u.dtype))
+            transform(
+                torch.as_tensor(state[name], dtype=u.dtype, device=u.device)
+            )
             for name, u, transform in zip(
                 self._state_names, self._u_pts_list, self._transforms
             )
         ]
-        return multilinear(self._u_pts_list, self._V_by_t[t], u_queries)
+        out = multilinear(self._u_pts_list, self._V_by_t[t], u_queries)
+        return out.to(target_device)
 
 
 def _make_warp_transform(grid_spec, warp):

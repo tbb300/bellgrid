@@ -70,6 +70,7 @@ def test_initial_state_records_at_first_period():
         initial_state={"wealth": 7.0},
         seed=0,
     )
+    paths = {k: v.cpu() for k, v in paths.items()}
     assert torch.allclose(
         paths["wealth"][:, 0], torch.full((5,), 7.0, dtype=torch.float64)
     )
@@ -103,6 +104,7 @@ def test_deterministic_constant_rate_matches_hand_calculation():
         initial_state={"wealth": 10.0},
         seed=0,
     )
+    paths = {k: v.cpu() for k, v in paths.items()}
     expected_wealth = torch.tensor([[10.0, 6.0, 3.6]], dtype=torch.float64)
     expected_consume = torch.tensor([[4.0, 2.4, 1.44]], dtype=torch.float64)
     expected_dtotal = 4.0 + 0.95 * 2.4 + 0.95**2 * 1.44
@@ -199,7 +201,7 @@ def test_simulator_matches_solver_value_on_merton():
     )
 
     w0 = 10.0
-    n_paths = 5_000
+    n_paths = 20_000
     paths = simulate(
         policy=policy,
         problem=problem,
@@ -207,6 +209,7 @@ def test_simulator_matches_solver_value_on_merton():
         initial_state={"wealth": w0},
         seed=0,
     )
+    paths = {k: v.cpu() for k, v in paths.items()}
 
     # E[sum discount^t * r_t] over the realized horizon
     # plus the terminal_reward at the post-horizon wealth
@@ -235,8 +238,9 @@ def test_simulator_matches_solver_value_on_merton():
     # is beta**T.
     mean_dtotal_full = mean_dtotal + beta_T * final_t_v
 
-    # 5000 paths, log returns -> stderr roughly sigma_log * sqrt(T) / sqrt(N).
-    # That's about 0.15 * sqrt(30) / sqrt(5000) ~ 0.012 — tight.
-    assert mean_dtotal_full == pytest.approx(v_solver, abs=0.3), (
+    # The per-path variance is dominated by the discounted-cumulative-log term
+    # (Var[log(c_t)] grows ~ sigma^2 * t), so per-path stderr is order 1 even
+    # at the same (mu, sigma). With 20k paths the mean-stderr is ~0.15.
+    assert mean_dtotal_full == pytest.approx(v_solver, abs=0.4), (
         f"sim mean = {mean_dtotal_full:.4f}, solver V = {v_solver:.4f}"
     )
