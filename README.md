@@ -32,7 +32,10 @@ def reward(state, action, shock, t):
     return torch.log(action["consume"])
 
 problem = Problem(
-    states=[ContinuousState("wealth", warp="asinh", range=(1e-3, 50.0))],
+    # Set the wealth range well above where you'll query: clamp-at-edge
+    # interpolation is the dominant error source for problems where
+    # the value function is unbounded (here V ~ log w grows without bound).
+    states=[ContinuousState("wealth", warp="asinh", range=(1e-3, 200.0))],
     actions=[ContinuousAction("consume", bounds=(1e-6, "wealth"))],
     transition=transition,
     reward=reward,
@@ -50,9 +53,9 @@ policy, value = solve(
 )
 
 # Optimal consumption rate at any wealth ≈ 1 - β = 0.040
-w = torch.tensor([2.0, 10.0, 25.0])
+w = torch.tensor([2.0, 10.0, 25.0, 50.0])
 policy({"wealth": w}, t=10)["consume"] / w
-# → tensor([0.0401, 0.0401, 0.0421])  (closed-form: 0.04 at every point)
+# → tensor([0.0401, 0.0401, 0.0401, 0.0401])  (closed-form: 0.04 at every point)
 ```
 
 Reward is whatever scalar callable matches your problem: utility maximization, cost minimization, profit, payoff. Sign convention: bellgrid maximizes — negate costs.

@@ -107,8 +107,12 @@ def terminal_reward(state):
     return A + B * torch.log(state["wealth"])
 
 
+# Set the wealth range well above the highest spot we'll query: clamp-at-edge
+# interpolation is the dominant error source for problems where the value
+# function is unbounded (here V grows as log w). Roughly, accurate results
+# at wealth w require the grid to extend to ~4w or more.
 problem = Problem(
-    states=[ContinuousState("wealth", warp="asinh", range=(1e-3, 50.0))],
+    states=[ContinuousState("wealth", warp="asinh", range=(1e-3, 200.0))],
     actions=[ContinuousAction("consume", bounds=(1e-6, "wealth"))],
     transition=transition,
     reward=reward,
@@ -133,7 +137,7 @@ policy, value = solve(
 # solver should recover that flat line across the support.
 
 # %%
-w_query = torch.linspace(0.5, 30.0, 200, dtype=torch.float64)
+w_query = torch.linspace(0.5, 50.0, 200, dtype=torch.float64)
 c_bellgrid = policy({"wealth": w_query}, t=T // 2)["consume"]
 rate_bellgrid = (c_bellgrid / w_query).numpy()
 
