@@ -59,7 +59,7 @@ Reward is whatever scalar callable matches your problem: utility maximization, c
 
 ## Examples
 
-Seven canonical problems, each validated against an analytical or numerical reference. Open the `.ipynb` files in JupyterLab or [view them on GitHub](examples/).
+Eight canonical problems, each validated against an analytical or numerical reference. Open the `.ipynb` files in JupyterLab or [view them on GitHub](examples/).
 
 | Notebook | Problem | Validates against |
 |---|---|---|
@@ -70,6 +70,7 @@ Seven canonical problems, each validated against an analytical or numerical refe
 | [`05_two_asset_merton`](examples/05_two_asset_merton/two_asset_merton.ipynb) | 2-asset Merton with correlated returns (`MultivariateNormal`) | Numerical FOC for the optimal portfolio share |
 | [`06_regime_switching_option`](examples/06_regime_switching_option/regime_switching_option.ipynb) | American put under regime-switching vol (`MarkovChain`) | Bracketed by constant-vol references at σ_low, σ_high, σ_stationary |
 | [`07_retirement_decision`](examples/07_retirement_decision/retirement_decision.ipynb) | Lifecycle work vs retire decision (`DiscreteState`, irreversible) | Qualitative — boundary falls with age, accumulate → retire → decumulate dynamics |
+| [`08_jump_diffusion_option`](examples/08_jump_diffusion_option/jump_diffusion_option.ipynb) | American put under Merton (1976) jump-diffusion (`Jump` + `Normal`, multi-shock) | European case validated against Merton 1976 series expansion (agreement within ~1e-3); American case shows the jump premium and lower exercise boundary |
 
 Each notebook opens with the problem statement and equations, then runs bellgrid against the reference side-by-side.
 
@@ -77,14 +78,13 @@ Each notebook opens with the problem statement and equations, then runs bellgrid
 
 - **States**: `ContinuousState` (with optional `asinh` / `log` warp), `DiscreteState`, `MarkovChain`.
 - **Actions**: `ContinuousAction` (with optional state-dependent bounds), `DiscreteAction`.
-- **Shocks**: `Normal`, `Lognormal`, `MultivariateNormal` — all with Gauss-Hermite quadrature.
+- **Shocks**: `Normal`, `Lognormal`, `MultivariateNormal`, `Jump` (Bernoulli-approximated Poisson with Normal log-magnitudes) — all with Gauss-Hermite quadrature. Multiple independent shocks per problem are supported via tensor-product quadrature.
 - **Grids**: `RegularGrid`, `WarpedGrid`.
 - **Solver**: `BackwardInduction` for finite horizon, CPU or CUDA, JIT-compiled K-D multilinear interpolation.
 - **Simulator**: `simulate()` shares the user's `transition` and `reward` with the solver, so they can't drift apart.
 
 ## Planned
 
-- `Jump` shock (Poisson + size distribution) — for jump-diffusion option pricing.
 - `PolicyIteration` solver — infinite-horizon problems (removes the truncate-with-closed-form-terminal hack).
 - Implicit differentiation of `policy` / `value` wrt model parameters.
 - Local action search instead of grid enumeration (for problems with many continuous actions).

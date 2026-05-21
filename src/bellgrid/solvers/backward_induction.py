@@ -33,11 +33,12 @@ from ..problem import (
     MarkovChain,
     Problem,
 )
+from ..shocks.jump import Jump
 from ..shocks.lognormal import Lognormal
 from ..shocks.multivariate_normal import MultivariateNormal
 from ..shocks.normal import Normal
 
-_SUPPORTED_SHOCKS = (Normal, Lognormal, MultivariateNormal)
+_SUPPORTED_SHOCKS = (Normal, Lognormal, MultivariateNormal, Jump)
 _SUPPORTED_ACTIONS = (ContinuousAction, DiscreteAction)
 _SUPPORTED_STATES = (ContinuousState, DiscreteState, MarkovChain)
 _SUPPORTED_GRIDS = (RegularGrid, WarpedGrid)
@@ -218,10 +219,6 @@ def _backward_induction(
         raise NotImplementedError(
             f"tracer supports only {[c.__name__ for c in _SUPPORTED_SHOCKS]} shocks"
         )
-    if len(supported) > 1:
-        raise NotImplementedError(
-            f"tracer supports at most one shock; got {len(supported)}"
-        )
 
     mc_states_user = [s for s in problem.states if isinstance(s, MarkovChain)]
     if len(mc_states_user) > 1:
@@ -373,18 +370,37 @@ def _backward_induction(
             action_tensors[a.name] = _to_state_shape(idx)
             action_kinds[a.name] = "discrete"
 
-    # ---- shock quadrature ----------------------------------------------
+    # ---- shock quadrature (tensor product over independent shocks) -----
+    # Each shock contributes a (name -> 1-D nodes, weights) pair. Joint
+    # quadrature is the cartesian product: N_q = ∏ N_q_i, weights are the
+    # product of per-shock weights at each joint node. Node count grows
+    # multiplicatively, so don't get carried away with many shocks at
+    # once — two or three is the comfortable territory.
     if supported:
-        shock = supported[0]
-        raw, shock_weights = shock.nodes_and_weights(
-            solver.n_quad, dtype=dtype, device=device
-        )
-        if isinstance(raw, dict):
-            shock_values = raw
-            N_q = next(iter(shock_values.values())).numel()
-        else:
-            shock_values = {shock.name: raw}
-            N_q = raw.numel()
+        shock_values: dict[str, torch.Tensor] = {}
+        shock_weights = torch.tensor([1.0], dtype=dtype, device=device)
+        N_q = 1
+        for shock in supported:
+            raw, w = shock.nodes_and_weights(
+                solver.n_quad, dtype=dtype, device=device
+            )
+            this_nodes = raw if isinstance(raw, dict) else {shock.name: raw}
+            n_this = w.numel()
+            # Expand current shock dimensions over the new shock's quadrature
+            # axis and vice versa, then flatten to a single (N_q * n_this,) axis.
+            new_values = {
+                name: val.unsqueeze(-1).expand(N_q, n_this).reshape(-1).contiguous()
+                for name, val in shock_values.items()
+            }
+            for name, val in this_nodes.items():
+                new_values[name] = (
+                    val.unsqueeze(0).expand(N_q, n_this).reshape(-1).contiguous()
+                )
+            shock_weights = (
+                shock_weights.unsqueeze(-1) * w.unsqueeze(0)
+            ).reshape(-1).contiguous()
+            shock_values = new_values
+            N_q = N_q * n_this
     else:
         shock_values = {}
         shock_weights = torch.ones(1, dtype=dtype, device=device)

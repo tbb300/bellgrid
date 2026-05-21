@@ -40,6 +40,15 @@ or run the source `.py` files directly.
   retirement boundary $w^*(t)$ falling from ~31 at age 0 to ~6 near
   the end of the horizon, plus a 500-path forward simulation of the
   accumulation → retirement → decumulation pattern.
+- `08_jump_diffusion_option/jump_diffusion_option.ipynb` — American
+  put under **Merton (1976) jump-diffusion**: standard GBM diffusion
+  plus rare downward jumps. First multi-shock example: pairs a
+  `Normal` diffusion shock with a `Jump` (Bernoulli-approximated
+  Poisson with Normal log-magnitudes). European value validated
+  against the Merton 1976 series-expansion closed form (agreement
+  within ~1e-3). For the American case, shows the jump premium and
+  the lower exercise boundary that jumps induce (downward-biased
+  jumps → more reason to hold).
 
 The notebooks are auto-generated from the `.py` source files via
 `jupytext --to ipynb <file>.py`. Edit the `.py` (easier to diff,

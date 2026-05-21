@@ -26,11 +26,12 @@ from .problem import (
     MarkovChain,
     Problem,
 )
+from .shocks.jump import Jump
 from .shocks.lognormal import Lognormal
 from .shocks.multivariate_normal import MultivariateNormal
 from .shocks.normal import Normal
 
-_SUPPORTED_SHOCKS = (Normal, Lognormal, MultivariateNormal)
+_SUPPORTED_SHOCKS = (Normal, Lognormal, MultivariateNormal, Jump)
 _SUPPORTED_STATES = (ContinuousState, DiscreteState, MarkovChain)
 _SUPPORTED_ACTIONS = (ContinuousAction, DiscreteAction)
 
