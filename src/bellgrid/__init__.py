@@ -2,16 +2,14 @@
 
 __version__ = "0.0.0"
 
-# Public API placeholders. Implementations land incrementally.
-# See docs/api.md for the intended surface.
+from .problem import ContinuousAction, ContinuousState, Problem
+from .solve import solve
 
 __all__ = [
     "Problem",
     "ContinuousState",
-    "DiscreteState",
-    "MarkovChain",
     "ContinuousAction",
-    "DiscreteAction",
     "solve",
-    "simulate",
+    # Planned (see docs/api.md), to be added as they land:
+    # "DiscreteState", "MarkovChain", "DiscreteAction", "simulate"
 ]
