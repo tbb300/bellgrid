@@ -2,17 +2,24 @@
 
 __version__ = "0.0.0"
 
-from .problem import ContinuousAction, ContinuousState, DiscreteAction, Problem
+from .problem import (
+    ContinuousAction,
+    ContinuousState,
+    DiscreteAction,
+    DiscreteState,
+    MarkovChain,
+    Problem,
+)
 from .simulate import simulate
 from .solve import solve
 
 __all__ = [
     "Problem",
     "ContinuousState",
+    "DiscreteState",
+    "MarkovChain",
     "ContinuousAction",
     "DiscreteAction",
     "solve",
     "simulate",
-    # Planned (see docs/api.md), to be added as they land:
-    # "DiscreteState", "MarkovChain"
 ]

@@ -188,3 +188,55 @@ def test_2d_query_shape_preserved():
     qy = torch.rand(3, 4, dtype=torch.float64)
     out = multilinear([gx, gy], values, [qx, qy])
     assert out.shape == qx.shape
+
+
+# --- mixed continuous + discrete axes ----------------------------------
+
+
+def test_mixed_cont_disc_exact_recovery():
+    """V(c, d) = 2c + d. Continuous interp + exact discrete gather."""
+    grid_c = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
+    grid_d = torch.arange(3, dtype=torch.long)
+    C, D = torch.meshgrid(grid_c, grid_d.to(torch.float64), indexing="ij")
+    V = 2.0 * C + D
+    qc = torch.tensor([0.5, 0.25, 0.75], dtype=torch.float64)
+    qd = torch.tensor([1, 0, 2], dtype=torch.long)
+    out = multilinear([grid_c, grid_d], V, [qc, qd])
+    expected = 2.0 * qc + qd.to(torch.float64)
+    assert torch.allclose(out, expected, atol=1e-12)
+
+
+def test_mixed_at_grid_point():
+    grid_c = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
+    grid_d = torch.arange(3, dtype=torch.long)
+    V = torch.rand(5, 3, dtype=torch.float64)
+    # Query at exact grid points
+    qc = torch.tensor([grid_c[1].item()], dtype=torch.float64)
+    qd = torch.tensor([2], dtype=torch.long)
+    out = multilinear([grid_c, grid_d], V, [qc, qd])
+    assert out.item() == pytest.approx(V[1, 2].item())
+
+
+def test_all_discrete_gather():
+    """All-discrete query is just an exact gather."""
+    grid_d1 = torch.arange(3, dtype=torch.long)
+    grid_d2 = torch.arange(4, dtype=torch.long)
+    V = torch.rand(3, 4, dtype=torch.float64)
+    qd1 = torch.tensor([1, 2], dtype=torch.long)
+    qd2 = torch.tensor([3, 0], dtype=torch.long)
+    out = multilinear([grid_d1, grid_d2], V, [qd1, qd2])
+    assert torch.allclose(
+        out,
+        torch.tensor([V[1, 3].item(), V[2, 0].item()], dtype=torch.float64),
+    )
+
+
+def test_discrete_dim_with_size_one_axis():
+    """Single-category discrete axis: must accept 1-point axis."""
+    grid_c = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
+    grid_d = torch.arange(1, dtype=torch.long)
+    V = torch.linspace(0, 1, 5, dtype=torch.float64).unsqueeze(-1)  # shape (5, 1)
+    qc = torch.tensor([0.5], dtype=torch.float64)
+    qd = torch.tensor([0], dtype=torch.long)
+    out = multilinear([grid_c, grid_d], V, [qc, qd])
+    assert out.item() == pytest.approx(0.5)

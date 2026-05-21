@@ -2,7 +2,16 @@ from types import SimpleNamespace
 
 import pytest
 
-from bellgrid import ContinuousAction, ContinuousState, DiscreteAction, Problem
+import numpy as np
+
+from bellgrid import (
+    ContinuousAction,
+    ContinuousState,
+    DiscreteAction,
+    DiscreteState,
+    MarkovChain,
+    Problem,
+)
 
 
 def _noop_transition(state, action, shock, t):
@@ -116,5 +125,93 @@ def test_discrete_action_name_collides_with_continuous():
             actions=[
                 ContinuousAction("a", bounds=(0, 1)),
                 DiscreteAction("a", n=2),
+            ],
+        )
+
+
+# --- DiscreteState -------------------------------------------------------
+
+
+def test_discrete_state_construction():
+    s = DiscreteState("phase", n=3)
+    assert s.name == "phase"
+    assert s.n == 3
+    assert s.labels is None
+
+
+def test_discrete_state_labels():
+    s = DiscreteState("phase", n=2, labels=("accumulation", "decumulation"))
+    assert s.labels == ("accumulation", "decumulation")
+
+
+def test_discrete_state_n_below_one_raises():
+    with pytest.raises(ValueError, match="n >= 1"):
+        DiscreteState("x", n=0)
+
+
+def test_discrete_state_label_length_mismatch_raises():
+    with pytest.raises(ValueError, match="length n=3"):
+        DiscreteState("x", n=3, labels=("a", "b"))
+
+
+def test_discrete_state_name_collision_with_action():
+    with pytest.raises(ValueError, match="Name collision"):
+        _basic_problem(
+            states=[
+                ContinuousState("wealth", range=(0, 100)),
+                DiscreteState("consumption", n=2),
+            ],
+        )
+
+
+# --- MarkovChain ---------------------------------------------------------
+
+
+_MC_P = [[0.9, 0.1], [0.2, 0.8]]
+
+
+def test_markov_chain_construction():
+    mc = MarkovChain("regime", matrix=_MC_P)
+    assert mc.name == "regime"
+    assert mc.n == 2
+    assert np.allclose(mc.matrix, _MC_P)
+
+
+def test_markov_chain_labels():
+    mc = MarkovChain("regime", matrix=_MC_P, labels=("bull", "bear"))
+    assert mc.labels == ("bull", "bear")
+
+
+def test_markov_chain_missing_matrix_raises():
+    with pytest.raises(ValueError, match="requires a transition matrix"):
+        MarkovChain("regime")
+
+
+def test_markov_chain_non_square_raises():
+    with pytest.raises(ValueError, match="must be square"):
+        MarkovChain("regime", matrix=[[1.0, 0.0], [0.0, 1.0], [0.5, 0.5]])
+
+
+def test_markov_chain_negative_entry_raises():
+    with pytest.raises(ValueError, match="non-negative"):
+        MarkovChain("regime", matrix=[[1.5, -0.5], [0.0, 1.0]])
+
+
+def test_markov_chain_not_row_stochastic_raises():
+    with pytest.raises(ValueError, match="row-stochastic"):
+        MarkovChain("regime", matrix=[[0.5, 0.4], [0.3, 0.7]])
+
+
+def test_markov_chain_label_length_mismatch_raises():
+    with pytest.raises(ValueError, match="length matching matrix"):
+        MarkovChain("regime", matrix=_MC_P, labels=("bull", "bear", "extra"))
+
+
+def test_markov_chain_name_collision_in_problem():
+    with pytest.raises(ValueError, match="Name collision"):
+        _basic_problem(
+            states=[
+                ContinuousState("wealth", range=(0, 100)),
+                MarkovChain("consumption", matrix=_MC_P),
             ],
         )

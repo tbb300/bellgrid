@@ -1,13 +1,14 @@
 """Problem container plus state and action primitives.
 
-Defines: Problem, ContinuousState, ContinuousAction. DiscreteState,
-DiscreteAction, and MarkovChain are planned (see docs/api.md) but not
-yet implemented.
+Defines: Problem, ContinuousState, DiscreteState, MarkovChain,
+ContinuousAction, DiscreteAction.
 """
 
 from collections import Counter
 from dataclasses import dataclass
 from typing import Callable, Optional, Union
+
+import numpy as np
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,70 @@ class ContinuousState:
     name: str
     range: tuple[float, float]
     warp: Optional[Union[str, Callable]] = None
+
+
+@dataclass(frozen=True)
+class DiscreteState:
+    """Finite-state variable with ``n`` integer values.
+
+    The user writes the transition dynamics for this state in their
+    ``transition`` callable (the solver doesn't supply built-in dynamics).
+    For a discrete state with a built-in row-stochastic transition matrix,
+    use ``MarkovChain`` instead.
+    """
+
+    name: str
+    n: int
+    labels: Optional[tuple] = None
+
+    def __post_init__(self):
+        if self.n < 1:
+            raise ValueError(f"DiscreteState requires n >= 1, got {self.n}")
+        if self.labels is not None and len(self.labels) != self.n:
+            raise ValueError(
+                f"DiscreteState labels must have length n={self.n}, "
+                f"got {len(self.labels)}"
+            )
+
+
+@dataclass(frozen=True)
+class MarkovChain:
+    """Discrete state with a built-in row-stochastic transition matrix.
+
+    ``matrix[i, j] = Pr(next = j | current = i)``; rows sum to 1. The number
+    of categories is inferred from ``matrix.shape[0]``. The solver advances
+    this state internally — the user's ``transition`` callable must NOT
+    return an entry for it.
+    """
+
+    name: str
+    matrix: object = None  # np.ndarray after __post_init__
+    labels: Optional[tuple] = None
+
+    def __post_init__(self):
+        if self.matrix is None:
+            raise ValueError("MarkovChain requires a transition matrix")
+        mat = np.asarray(self.matrix, dtype=np.float64)
+        if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
+            raise ValueError(
+                f"MarkovChain matrix must be square 2-D; got shape {mat.shape}"
+            )
+        if (mat < 0).any():
+            raise ValueError("MarkovChain matrix entries must be non-negative")
+        if not np.allclose(mat.sum(axis=1), 1.0, atol=1e-10):
+            raise ValueError(
+                "MarkovChain matrix must be row-stochastic (rows sum to 1)"
+            )
+        object.__setattr__(self, "matrix", mat)
+        if self.labels is not None and len(self.labels) != mat.shape[0]:
+            raise ValueError(
+                f"MarkovChain labels must have length matching matrix "
+                f"({mat.shape[0]}); got {len(self.labels)}"
+            )
+
+    @property
+    def n(self) -> int:
+        return self.matrix.shape[0]
 
 
 @dataclass(frozen=True)
