@@ -18,6 +18,12 @@ or run the source `.py` files directly.
 - `04_lqg/lqg.ipynb` — 2-D LQR + Gaussian noise, validated against the
   closed-form discrete-time Riccati recursion. Heatmaps and slices of
   $V_0(x)$ and $u^*_0(x)$ side-by-side.
+- `05_two_asset_merton/two_asset_merton.ipynb` — log-utility
+  consumption-portfolio choice between two risky assets with **correlated
+  lognormal returns**. Exercises `MultivariateNormal` as a 2-D shock.
+  Validated against the numerical FOC for the optimal portfolio share;
+  sweeps correlation to show the diversification effect (π* runs from
+  ~0.75 at ρ = -0.8 to a corner at 1.0 once ρ ≳ 0.4).
 
 The notebooks are auto-generated from the `.py` source files via
 `jupytext --to ipynb <file>.py`. Edit the `.py` (easier to diff,
