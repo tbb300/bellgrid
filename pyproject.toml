@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-examples = ["matplotlib>=3.8", "jupyter>=1.0"]
+examples = ["matplotlib>=3.8", "jupyter>=1.0", "jupytext>=1.16"]
 dev = ["pytest>=8.0", "ruff>=0.5"]
 
 [project.urls]
