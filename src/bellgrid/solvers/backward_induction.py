@@ -35,17 +35,20 @@ class _Policy:
     def __init__(
         self,
         state_name: str,
-        s_pts: torch.Tensor,
+        u_pts: torch.Tensor,
+        transform: Callable[[torch.Tensor], torch.Tensor],
         policy_by_t: dict,
     ) -> None:
         self._state_name = state_name
-        self._s_pts = s_pts
+        self._u_pts = u_pts
+        self._transform = transform
         self._policy_by_t = policy_by_t
 
     def __call__(self, state: dict, t):
-        s = torch.as_tensor(state[self._state_name], dtype=self._s_pts.dtype)
+        s = torch.as_tensor(state[self._state_name], dtype=self._u_pts.dtype)
+        u = self._transform(s)
         return {
-            name: multilinear([self._s_pts], arr, [s])
+            name: multilinear([self._u_pts], arr, [u])
             for name, arr in self._policy_by_t[t].items()
         }
 
@@ -56,16 +59,19 @@ class _Value:
     def __init__(
         self,
         state_name: str,
-        s_pts: torch.Tensor,
+        u_pts: torch.Tensor,
+        transform: Callable[[torch.Tensor], torch.Tensor],
         V_by_t: dict,
     ) -> None:
         self._state_name = state_name
-        self._s_pts = s_pts
+        self._u_pts = u_pts
+        self._transform = transform
         self._V_by_t = V_by_t
 
     def __call__(self, state: dict, t):
-        s = torch.as_tensor(state[self._state_name], dtype=self._s_pts.dtype)
-        return multilinear([self._s_pts], self._V_by_t[t], [s])
+        s = torch.as_tensor(state[self._state_name], dtype=self._u_pts.dtype)
+        u = self._transform(s)
+        return multilinear([self._u_pts], self._V_by_t[t], [u])
 
 
 def _backward_induction(
@@ -111,12 +117,25 @@ def _backward_induction(
     if state_name not in state_grid:
         raise ValueError(f"state_grid missing entry for state {state_name!r}")
     grid_spec = state_grid[state_name]
-    if not isinstance(grid_spec, RegularGrid):
+    from ..grids.warped import WarpedGrid
+
+    if not isinstance(grid_spec, (RegularGrid, WarpedGrid)):
         raise NotImplementedError(
-            f"tracer only supports RegularGrid; got {type(grid_spec).__name__}"
+            f"tracer only supports RegularGrid/WarpedGrid; "
+            f"got {type(grid_spec).__name__}"
         )
-    s_pts = grid_spec.points(*state.range, dtype=dtype, device=device)
+    s_pts = grid_spec.points(
+        *state.range, dtype=dtype, device=device, warp=state.warp
+    )
     N_s = s_pts.shape[0]
+    # Coordinates used for interpolation. Identity under RegularGrid; the
+    # forward warp under WarpedGrid — so a log-warp + log-utility problem
+    # is interp-exact, asinh shaves a chunk off the V error vs. physical
+    # interp, etc.
+    u_pts = grid_spec.transform_for_interp(s_pts, warp=state.warp)
+
+    def _to_u(x: torch.Tensor) -> torch.Tensor:
+        return grid_spec.transform_for_interp(x, warp=state.warp)
 
     # ---- build action grids (cartesian product on normalized [0, 1]) ---
     for action in cont_actions:
@@ -215,7 +234,8 @@ def _backward_induction(
         next_s = torch.as_tensor(next_state_dict[state_name], dtype=dtype, device=device)
         next_s = next_s.broadcast_to((N_s, N_a, N_q)).contiguous()
 
-        V_at_next = multilinear([s_pts], V_next, [next_s])  # (N_s, N_a, N_q)
+        u_next = _to_u(next_s)
+        V_at_next = multilinear([u_pts], V_next, [u_next])  # (N_s, N_a, N_q)
 
         # Bellman: max_a E_shock[ r(s,a,xi) + discount * V(s'(s,a,xi)) ]
         integrand = r + discount * V_at_next
@@ -231,6 +251,6 @@ def _backward_induction(
         V_next = V_now
 
     return (
-        _Policy(state_name, s_pts, policy_by_t),
-        _Value(state_name, s_pts, V_by_t),
+        _Policy(state_name, u_pts, _to_u, policy_by_t),
+        _Value(state_name, u_pts, _to_u, V_by_t),
     )

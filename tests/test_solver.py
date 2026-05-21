@@ -112,6 +112,42 @@ def test_state_dependent_bounds_respected():
     assert (actions["consume"] >= 0).all()
 
 
+def test_solver_runs_with_warped_grid():
+    """Solver accepts WarpedGrid for the state grid; warp inherits from state."""
+    from bellgrid.grids import WarpedGrid
+
+    def transition(state, action, shock, t):
+        return {"wealth": state["wealth"] - action["consume"]}
+
+    def reward(state, action, shock, t):
+        return action["consume"]
+
+    problem = Problem(
+        states=[ContinuousState("wealth", warp="asinh", range=(0.0, 10.0))],
+        actions=[ContinuousAction("consume", bounds=(0.0, "wealth"))],
+        transition=transition,
+        reward=reward,
+        shocks=[],
+        horizon=range(0, 2),
+        discount=1.0,
+    )
+
+    policy, value = solve(
+        problem,
+        state_grid={"wealth": WarpedGrid(n=50)},  # asinh inherited from state
+        action_grid={"consume": RegularGrid(n=100)},
+        solver=BackwardInduction(),
+    )
+
+    w = torch.tensor([1.0, 5.0, 9.0], dtype=torch.float64)
+    v = value({"wealth": w}, t=0)
+    a = policy({"wealth": w}, t=0)
+    # 2-period linear-reward problem: V(w) = w to grid tolerance
+    assert torch.allclose(v, w, rtol=0.05)
+    assert (a["consume"] >= 0).all()
+    assert (a["consume"] <= w + 1e-9).all()
+
+
 def test_solver_runs_with_normal_shock():
     """Smoke: stochastic problem with a single Normal shock runs end-to-end."""
     from bellgrid.shocks import Normal

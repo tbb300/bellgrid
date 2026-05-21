@@ -27,8 +27,25 @@ class RegularGrid:
         *,
         dtype: torch.dtype = torch.float64,
         device: str | torch.device = "cpu",
+        warp: object = None,  # accepted for signature uniformity; ignored
     ) -> torch.Tensor:
-        """Return `n` linearly spaced points in `[low, high]` (inclusive)."""
+        """Return `n` linearly spaced points in `[low, high]` (inclusive).
+
+        The ``warp`` kwarg is accepted to keep the call site uniform with
+        ``WarpedGrid.points`` but is ignored — `RegularGrid` is always
+        uniformly spaced.
+        """
+        del warp
         if not (high > low):
             raise ValueError(f"RegularGrid.points requires high > low, got [{low}, {high}]")
         return torch.linspace(low, high, self.n, dtype=dtype, device=device)
+
+    def transform_for_interp(
+        self,
+        x: torch.Tensor,
+        *,
+        warp: object = None,
+    ) -> torch.Tensor:
+        """Identity: ``RegularGrid`` interpolates in physical space."""
+        del warp
+        return x

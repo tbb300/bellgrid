@@ -19,7 +19,7 @@ import math
 import torch
 
 from bellgrid import ContinuousAction, ContinuousState, Problem, solve
-from bellgrid.grids import RegularGrid
+from bellgrid.grids import RegularGrid, WarpedGrid
 from bellgrid.shocks import Normal
 from bellgrid.solvers import BackwardInduction
 
@@ -33,7 +33,16 @@ def _closed_form_coefficients(beta: float, mu: float):
     return A, B
 
 
-def _build_problem(beta: float, mu: float, sigma: float, T: int):
+def _build_problem(
+    beta: float,
+    mu: float,
+    sigma: float,
+    T: int,
+    *,
+    warp: str | None = None,
+    wealth_range: tuple[float, float] = (0.5, 50.0),
+    consume_low: float = 1e-3,
+):
     A, B = _closed_form_coefficients(beta, mu)
 
     def transition(state, action, shock, _t):
@@ -49,8 +58,8 @@ def _build_problem(beta: float, mu: float, sigma: float, T: int):
         return A + B * torch.log(state["wealth"])
 
     return Problem(
-        states=[ContinuousState("wealth", range=(0.5, 50.0))],
-        actions=[ContinuousAction("consume", bounds=(1e-3, "wealth"))],
+        states=[ContinuousState("wealth", warp=warp, range=wealth_range)],
+        actions=[ContinuousAction("consume", bounds=(consume_low, "wealth"))],
         transition=transition,
         reward=reward,
         shocks=[Normal("z", sigma=1.0)],
@@ -186,7 +195,7 @@ def test_merton_print_comparison_table():
 
 
 def test_merton_print_resolution_sweep():
-    """Sweep grid resolution; print error decay vs closed form."""
+    """Sweep grid resolution under RegularGrid and WarpedGrid; print error decay."""
     beta, mu, sigma = 0.96, 0.04, 0.15
     A, B = _closed_form_coefficients(beta, mu)
     expected_rate = 1.0 - beta
@@ -197,40 +206,82 @@ def test_merton_print_resolution_sweep():
     print()
     print(f"Resolution sweep  |  beta={beta}, mu={mu}, sigma={sigma}, t=5")
     print()
-    print(f"{'n_wealth':>10} {'n_consume':>11} {'n_quad':>8}"
+    print(f"{'grid':>9} {'n_wealth':>10} {'n_consume':>11} {'n_quad':>8}"
           f" {'max |Δ c/w|':>14} {'max |Δ V|':>14} {'wall (s)':>10}")
-    print("-" * 75)
+    print("-" * 85)
 
     import time
 
-    prev_v_err = None
-    for n_w, n_c, n_q in [(32, 100, 5), (64, 200, 5), (128, 500, 7), (256, 1000, 9)]:
-        problem = _build_problem(beta, mu, sigma, T=10)
-        t0 = time.perf_counter()
-        policy, value = solve(
-            problem,
-            state_grid={"wealth": RegularGrid(n=n_w)},
-            action_grid={"consume": RegularGrid(n=n_c)},
-            solver=BackwardInduction(n_quad=n_q),
-        )
-        wall = time.perf_counter() - t0
-
-        rates = policy({"wealth": test_w}, t=5)["consume"] / test_w
-        v = value({"wealth": test_w}, t=5)
-        rate_err = (rates - expected_rate).abs().max().item()
-        v_err = (v - v_cf).abs().max().item()
-
-        print(f"{n_w:>10d} {n_c:>11d} {n_q:>8d}"
-              f" {rate_err:>14.4e} {v_err:>14.4e} {wall:>10.3f}")
-
-        if prev_v_err is not None:
-            # error should decrease as we refine; allow small slack
-            assert v_err <= prev_v_err * 1.5, (
-                f"V error grew with refinement: {prev_v_err:.4e} → {v_err:.4e}"
+    for grid_label, grid_factory in [
+        ("Regular", lambda n: (RegularGrid(n=n), None, (0.5, 50.0))),
+        ("Warped",  lambda n: (WarpedGrid(n=n),  "asinh", (1e-3, 50.0))),
+    ]:
+        prev_v_err = None
+        for n_w, n_c, n_q in [(32, 100, 5), (64, 200, 5), (128, 500, 7), (256, 1000, 9)]:
+            wealth_grid, warp, wealth_range = grid_factory(n_w)
+            problem = _build_problem(
+                beta, mu, sigma, T=10, warp=warp, wealth_range=wealth_range
             )
-        prev_v_err = v_err
+            t0 = time.perf_counter()
+            policy, value = solve(
+                problem,
+                state_grid={"wealth": wealth_grid},
+                action_grid={"consume": RegularGrid(n=n_c)},
+                solver=BackwardInduction(n_quad=n_q),
+            )
+            wall = time.perf_counter() - t0
 
-    print()
+            rates = policy({"wealth": test_w}, t=5)["consume"] / test_w
+            v = value({"wealth": test_w}, t=5)
+            rate_err = (rates - expected_rate).abs().max().item()
+            v_err = (v - v_cf).abs().max().item()
+
+            print(f"{grid_label:>9} {n_w:>10d} {n_c:>11d} {n_q:>8d}"
+                  f" {rate_err:>14.4e} {v_err:>14.4e} {wall:>10.3f}")
+
+            if prev_v_err is not None:
+                assert v_err <= prev_v_err * 1.5, (
+                    f"{grid_label} V error grew with refinement: "
+                    f"{prev_v_err:.4e} → {v_err:.4e}"
+                )
+            prev_v_err = v_err
+        print()
+
+
+def test_merton_warped_grid_reclaims_low_wealth():
+    """With an asinh-warped wealth grid starting near 0, the closed-form
+    policy is recovered at low wealth (where the regular grid showed a
+    boundary artifact)."""
+    beta, mu, sigma = 0.96, 0.04, 0.15
+    A, B = _closed_form_coefficients(beta, mu)
+    expected_rate = 1.0 - beta
+
+    problem = _build_problem(
+        beta, mu, sigma, T=10,
+        warp="asinh", wealth_range=(1e-3, 50.0), consume_low=1e-6,
+    )
+    policy, value = solve(
+        problem,
+        state_grid={"wealth": WarpedGrid(n=128)},     # asinh inherited
+        action_grid={"consume": RegularGrid(n=500)},
+        solver=BackwardInduction(n_quad=7),
+    )
+
+    # w=1.0 is the value that failed under the regular grid setup
+    test_w = torch.tensor([1.0, 2.0, 5.0, 10.0, 20.0], dtype=torch.float64)
+    actions = policy({"wealth": test_w}, t=5)
+    rates = actions["consume"] / test_w
+    expected = torch.full_like(rates, expected_rate)
+    assert torch.allclose(rates, expected, rtol=0.05, atol=0.005), (
+        f"rates={rates.tolist()}"
+    )
+
+    # V should match closed form across the same range
+    v = value({"wealth": test_w}, t=5)
+    v_cf = A + B * torch.log(test_w)
+    assert torch.allclose(v, v_cf, rtol=0.02, atol=1.0), (
+        f"V={v.tolist()}, expected={v_cf.tolist()}"
+    )
 
 
 def test_merton_print_parameter_sweep():
