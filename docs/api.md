@@ -1,6 +1,6 @@
-# bellgrid API (draft)
+# bellgrid API
 
-This document sketches the public API before the implementation lands. It will change. Comments and issues welcome.
+The current public API. Items not yet implemented are marked **(planned)**.
 
 ## Design principles
 
@@ -49,17 +49,18 @@ Bounds can reference state variables. In `policy(state, t)` outputs, continuous 
 Shocks in bellgrid are *iid innovations*. Persistent processes (AR(1), GARCH, ...) belong in state — see [Persistent shocks](#persistent-shocks) below. Markov-chain dynamics belong in state too — see `MarkovChain` above.
 
 ```python
-from bellgrid.shocks import Normal, MultivariateNormal, Lognormal, Jump
+from bellgrid.shocks import Normal, MultivariateNormal, Lognormal
+# from bellgrid.shocks import Jump   # planned
 
 equity_shock = Normal("equity", sigma=0.18)         # sigma defaults to 1.0 (standard normal)
 yield_shock  = Lognormal("yield", mu=0.03, sigma=0.02)
 correlated   = MultivariateNormal(names=["equity", "bonds"],
                                   mean=[0.07, 0.03], cov=...)
-jumps        = Jump("rare_event", intensity=0.02,           # per-period jump probability
-                    size_dist=Lognormal(mu=-0.1, sigma=0.2))
+# jumps      = Jump("rare_event", intensity=0.02,            # planned
+#                   size_dist=Lognormal(mu=-0.1, sigma=0.2))
 ```
 
-Quadrature: Gauss-Hermite for `Normal`/`Lognormal`, Cholesky-rotated Gauss-Hermite for `MultivariateNormal`, mixed for `Jump`. The solver picks quadrature order based on accuracy targets.
+Quadrature: Gauss-Hermite for `Normal`/`Lognormal`, Cholesky-rotated tensor-product Gauss-Hermite for `MultivariateNormal`. `Jump` will use mixed quadrature when it lands. The solver supports at most one shock object per problem (a `MultivariateNormal` counts as one even though it carries K named dimensions).
 
 Shock names are optional — nameless shocks work as `size_dist` for `Jump` or any inner-distribution slot where they're not surfaced through `shock[...]`. Defaults: `Normal()` is standard normal; `Lognormal()` is standard lognormal, with `mu` and `sigma` as parameters of the underlying normal (`log(X) ~ N(mu, sigma)`). `MultivariateNormal` has no no-args default — pass `names=[...]` (or `dim=N`) to fix the dimensionality, and `names[i]` indexes both `mean[i]` and row/column `i` of `cov`.
 
@@ -187,7 +188,7 @@ policy, value = solve(
                 "basis_fraction": RegularGrid(n=16)},
     action_grid={"draw": RegularGrid(n=64),
                  "equity_share": RegularGrid(n=33)},
-    solver=BackwardInduction(),         # or PolicyIteration(tol=1e-7) for horizon=None
+    solver=BackwardInduction(),         # PolicyIteration(tol=1e-7) for horizon=None is planned
     device="cuda",
     dtype="float64",                    # float32 is faster but risky for wide-range value funcs or -inf rewards (NaN risk)
     chunk_size=2**20,                   # batch size for Bellman expectation; lower if OOM
@@ -198,7 +199,7 @@ policy, value = solve(
 
 `chunk_size` controls the batch size for evaluating the Bellman expectation — the joint grid of states × shock quadrature nodes is processed in chunks of this size. Lower it if you OOM; raise it for throughput on large devices.
 
-Defaults and required arguments: `state_grid` is required when there are continuous states; `action_grid` when there are continuous actions; `solver` has no default (pass `BackwardInduction()` for finite horizon, `PolicyIteration(tol=...)` for `horizon=None`). `PolicyIteration.tol` is the L∞ convergence threshold on the value function. The remaining arguments default to `device="cpu"`, `dtype="float64"`, `chunk_size=2**20`.
+Defaults and required arguments: `state_grid` is required when there are continuous states; `action_grid` when there are continuous actions; `solver` has no default (pass `BackwardInduction()` for finite horizon; `PolicyIteration(tol=...)` for `horizon=None` is planned). The remaining arguments default to `device="cuda" if available else "cpu"`, `dtype="float64"`, `chunk_size=2**20` (the latter is currently accepted but unused — it'll matter once memory-chunked Bellman updates land).
 
 `policy(state, t)` and `value(state, t)` are time-indexed for finite-horizon problems — the solver stores a separate V and π slice at each `t` in `horizon`. Pass `t=None` for infinite-horizon problems, where V and π are stationary. Both accept batched state dicts (equal-shaped tensors) and return batched actions and values; scalar dicts work too for one-off queries.
 
@@ -221,7 +222,7 @@ paths = simulate(
 
 `paths` is a dict of tensors. State and action keys carry realized values shaped `(n, len(horizon))`; axis 1 indexes the values in `horizon` (so for `horizon=range(25, 120)` the columns are `t = 25, 26, …, 119`). `paths["reward"]` is the per-step realized reward at each `t`; `paths["discounted_total"]` is the per-path scalar sum of discounted rewards.
 
-`initial_state` must specify every state variable except `MarkovChain` states, which default to draws from the stationary distribution of their transition matrix. Specify a `MarkovChain` state explicitly (e.g., `"regime": 2`) to start at a particular category.
+`initial_state` must specify every state variable, including `MarkovChain` states (e.g., `"regime": 2`). (Defaulting `MarkovChain` initial state to the stationary distribution is planned but not currently implemented — pass an explicit category index for now.)
 
 The simulator uses the *same* transition and reward functions as the solver. There is no opportunity for the simulator and solver to drift apart.
 
