@@ -85,7 +85,7 @@ def test_tuple_form_also_works():
 def test_mismatched_shapes_raise():
     grid = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
     values_bad = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
-    with pytest.raises(ValueError, match="same shape"):
+    with pytest.raises(ValueError, match="does not match values.shape"):
         multilinear(grid, values_bad, torch.tensor([0.5], dtype=torch.float64))
 
 
@@ -118,11 +118,73 @@ def test_axes_queries_count_mismatch_raises():
         multilinear([grid], values, [q1, q1])
 
 
-def test_higher_dim_not_implemented():
-    grid_x = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
-    grid_y = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
-    values_2d = torch.zeros(5, 5, dtype=torch.float64)
+def test_2d_bilinear_function_exact():
+    """f(x, y) = a*x + b*y + c — bilinear, recovered exactly."""
+    gx = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
+    gy = torch.linspace(0.0, 2.0, 7, dtype=torch.float64)
+    X, Y = torch.meshgrid(gx, gy, indexing="ij")
+    values = 3.0 * X + 2.0 * Y + 1.0
+    qx = torch.tensor([0.13, 0.47, 0.82], dtype=torch.float64)
+    qy = torch.tensor([0.31, 1.05, 1.79], dtype=torch.float64)
+    expected = 3.0 * qx + 2.0 * qy + 1.0
+    out = multilinear([gx, gy], values, [qx, qy])
+    assert torch.allclose(out, expected, atol=1e-12)
+
+
+def test_2d_at_grid_points():
+    gx = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    gy = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    X, Y = torch.meshgrid(gx, gy, indexing="ij")
+    values = X**2 + Y**3
+    # Query at the (i, j) = (1, 2) grid point
+    qx = torch.tensor([gx[1].item()], dtype=torch.float64)
+    qy = torch.tensor([gy[2].item()], dtype=torch.float64)
+    out = multilinear([gx, gy], values, [qx, qy])
+    assert out.item() == pytest.approx(values[1, 2].item())
+
+
+def test_2d_center_of_unit_cell():
+    """Bilinear at the center of a cell averages the four corners."""
+    gx = torch.tensor([0.0, 1.0], dtype=torch.float64)
+    gy = torch.tensor([0.0, 1.0], dtype=torch.float64)
+    values = torch.tensor([[10.0, 20.0], [30.0, 40.0]], dtype=torch.float64)
     qx = torch.tensor([0.5], dtype=torch.float64)
     qy = torch.tensor([0.5], dtype=torch.float64)
-    with pytest.raises(NotImplementedError, match="K=2"):
-        multilinear([grid_x, grid_y], values_2d, [qx, qy])
+    out = multilinear([gx, gy], values, [qx, qy])
+    assert out.item() == pytest.approx(25.0)
+
+
+def test_2d_below_grid_clamps_to_corner():
+    gx = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    gy = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    X, Y = torch.meshgrid(gx, gy, indexing="ij")
+    values = X + Y
+    qx = torch.tensor([-1.0], dtype=torch.float64)
+    qy = torch.tensor([-2.0], dtype=torch.float64)
+    out = multilinear([gx, gy], values, [qx, qy])
+    assert out.item() == pytest.approx(values[0, 0].item())
+
+
+def test_3d_trilinear_function_exact():
+    gx = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    gy = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    gz = torch.linspace(0.0, 1.0, 4, dtype=torch.float64)
+    X, Y, Z = torch.meshgrid(gx, gy, gz, indexing="ij")
+    values = 1.0 + 2.0 * X + 3.0 * Y + 4.0 * Z  # affine, exact in 3-D
+    qx = torch.tensor([0.27], dtype=torch.float64)
+    qy = torch.tensor([0.51], dtype=torch.float64)
+    qz = torch.tensor([0.83], dtype=torch.float64)
+    expected = 1.0 + 2.0 * qx + 3.0 * qy + 4.0 * qz
+    out = multilinear([gx, gy, gz], values, [qx, qy, qz])
+    assert torch.allclose(out, expected, atol=1e-12)
+
+
+def test_2d_query_shape_preserved():
+    gx = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
+    gy = torch.linspace(0.0, 1.0, 5, dtype=torch.float64)
+    X, Y = torch.meshgrid(gx, gy, indexing="ij")
+    values = X * Y
+    qx = torch.rand(3, 4, dtype=torch.float64)
+    qy = torch.rand(3, 4, dtype=torch.float64)
+    out = multilinear([gx, gy], values, [qx, qy])
+    assert out.shape == qx.shape
