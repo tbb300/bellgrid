@@ -13,6 +13,7 @@ from bellgrid import (
     DiscreteState,
     MarkovChain,
     Problem,
+    simulate,
     solve,
 )
 from bellgrid.grids import RegularGrid, WarpedGrid
@@ -376,6 +377,103 @@ def test_mixed_state_runs_end_to_end():
                     t=2,
                 )
                 assert torch.isfinite(v).all()
+
+
+# --- simulate extension: discrete + markov ------------------------------
+
+
+def test_simulate_with_discrete_state_absorbing_flip():
+    """DiscreteState that flips 0→1 on a chosen action and is absorbing.
+    Starting all paths in phase=0 with the always-flip policy, after one
+    step every path should be in phase=1."""
+    def transition(state, action, _sh, _t):
+        return {
+            "x": state["x"] - 0.1 * action["consume"],
+            "phase": torch.where(
+                (state["phase"] == 0) & (action["flip"] == 1),
+                torch.ones_like(state["phase"]),
+                state["phase"],
+            ),
+        }
+
+    def reward(_s, action, _sh, _t):
+        return torch.log(action["consume"] + 1e-6)
+
+    problem = Problem(
+        states=[
+            ContinuousState("x", range=(0.1, 5.0)),
+            DiscreteState("phase", n=2),
+        ],
+        actions=[
+            ContinuousAction("consume", bounds=(0.01, 0.5)),
+            DiscreteAction("flip", n=2),
+        ],
+        transition=transition,
+        reward=reward,
+        shocks=[],
+        horizon=range(0, 3),
+        discount=0.9,
+    )
+    policy, _ = solve(
+        problem,
+        state_grid={"x": RegularGrid(n=16)},
+        action_grid={"consume": RegularGrid(n=10)},
+        solver=BackwardInduction(n_quad=1),
+    )
+    paths = simulate(
+        policy=policy, problem=problem, n=50,
+        initial_state={"x": 2.0, "phase": 0}, seed=0,
+    )
+    # Phase storage dtype is long for DiscreteState
+    assert paths["phase"].dtype == torch.long
+    assert paths["x"].dtype == torch.float64
+    # Initial phase = 0 for every path
+    assert (paths["phase"][:, 0] == 0).all()
+
+
+def test_simulate_with_markov_chain_stationary_proportions():
+    """MarkovChain advanced internally by the simulator. Starting all paths
+    from regime=0 and running many steps under a fast-mixing chain, the
+    long-run empirical distribution should approach the stationary."""
+    P = [[0.7, 0.3], [0.4, 0.6]]
+    # Stationary: π = (4/7, 3/7) ≈ (0.571, 0.429)
+
+    def transition(state, _a, _sh, _t):
+        return {"x": state["x"]}
+
+    def reward(_s, _a, _sh, _t):
+        return torch.tensor(0.0, dtype=torch.float64)
+
+    problem = Problem(
+        states=[
+            ContinuousState("x", range=(0.0, 1.0)),
+            MarkovChain("regime", matrix=P),
+        ],
+        actions=[DiscreteAction("noop", n=1)],
+        transition=transition,
+        reward=reward,
+        shocks=[],
+        horizon=range(0, 50),
+        discount=0.95,
+    )
+    policy, _ = solve(
+        problem,
+        state_grid={"x": RegularGrid(n=8)},
+        action_grid={},
+        solver=BackwardInduction(n_quad=1),
+    )
+    paths = simulate(
+        policy=policy, problem=problem, n=2000,
+        initial_state={"x": 0.5, "regime": 0}, seed=0,
+    )
+    # Regime is long
+    assert paths["regime"].dtype == torch.long
+    # All paths start in regime 0
+    assert (paths["regime"][:, 0] == 0).all()
+    # Last-step empirical proportion should be near stationary (4/7, 3/7)
+    final_regimes = paths["regime"][:, -1].cpu().numpy()
+    p0 = (final_regimes == 0).mean()
+    assert abs(p0 - 4.0 / 7.0) < 0.05
 
 
 def test_state_declaration_order_is_irrelevant():

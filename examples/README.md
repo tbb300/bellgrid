@@ -32,6 +32,14 @@ or run the source `.py` files directly.
   shown per regime, sandwiched between three constant-vol references
   (σ_low, σ_high, σ_stationary_avg); the turbulent exercise boundary
   sits well below the calm one (high vol → hold longer).
+- `07_retirement_decision/retirement_decision.ipynb` — lifecycle
+  consumption-savings problem where the agent also chooses **when to
+  retire**. Uses `DiscreteState` for the irreversible
+  working/retired phase (user-controlled dynamics: once retired, stay
+  retired) and a leisure bonus in the utility function. Shows the
+  retirement boundary $w^*(t)$ falling from ~31 at age 0 to ~6 near
+  the end of the horizon, plus a 500-path forward simulation of the
+  accumulation → retirement → decumulation pattern.
 
 The notebooks are auto-generated from the `.py` source files via
 `jupytext --to ipynb <file>.py`. Edit the `.py` (easier to diff,
