@@ -1,6 +1,6 @@
 [project]
 name = "bellgrid"
-version = "0.0.0"
+version = "0.1.0a0"
 description = "GPU-native backward-induction MDP solver for continuous-state stochastic dynamic programs."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -8,11 +8,12 @@ license = { text = "MIT" }
 authors = [{ name = "Tom Barrett" }]
 keywords = ["dynamic-programming", "bellman", "mdp", "backward-induction", "stochastic-control"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 dependencies = [

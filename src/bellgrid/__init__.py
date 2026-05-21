@@ -1,6 +1,6 @@
 """bellgrid: GPU-native backward-induction MDP solver."""
 
-__version__ = "0.0.0"
+__version__ = "0.1.0a0"
 
 from .problem import (
     ContinuousAction,
