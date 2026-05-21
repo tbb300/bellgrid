@@ -2,13 +2,10 @@
 
 - [When to use bellgrid (vs. RL)](when_to_use.md) — start here; this is the positioning piece.
 - [API draft](api.md) — public surface, subject to change.
-- [Examples](../examples/) — Merton, Carroll/Deaton, American option (more to come; see roadmap).
+- [Examples](../examples/) — Merton, Carroll/Deaton, American option, LQG (all four canonical examples).
 
-## Roadmap
+## Status
 
-| Phase | Months | Deliverables |
-|---|---|---|
-| Core | 1–3 | API skeleton, regular + warped grids, GPU backward induction, Merton example with closed-form validation |
-| Multi-dim | 4–6 | Multi-dim continuous states, shock framework, Carroll/Deaton + American option, **MVP on PyPI** |
-| Mixed | 7–9 | Discrete-continuous mixed states, account/tax machinery, lifecycle decumulation + Roth ladder |
-| Launch | 10–12 | Docs site, benchmark suite (vs. Tasmanian, vs. hand-rolled, vs. RL), JOSS submission, public launch |
+The four canonical examples (Merton, Carroll/Deaton, American option, LQG) all run end-to-end and validate against analytical or numerical references. Core primitives in place: `ContinuousState`, `ContinuousAction`, `DiscreteAction`, `Normal` / `Lognormal` shocks with Gauss-Hermite quadrature, `RegularGrid` / `WarpedGrid` (asinh, log), JIT-compiled K-D multilinear interpolation, finite-horizon `BackwardInduction` solver on CPU or CUDA.
+
+Planned but not yet implemented: `DiscreteState` / `MarkovChain` (regime-switching states), `MultivariateNormal` / `Jump` shocks, `PolicyIteration` (infinite-horizon), implicit differentiation, warm-starting.

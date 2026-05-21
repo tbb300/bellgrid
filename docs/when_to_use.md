@@ -82,6 +82,6 @@ Some problems live on the boundary. Practical guidance:
 
 - A general-purpose RL framework. There are excellent ones; we link to them.
 - A symbolic DP solver. Dolo/Dolang serve that audience; we are numerical.
-- A grid-math library. Tasmanian is the gold standard for grid math; we benchmark against a hand-rolled Tasmanian DP loop but don't depend on it.
+- A grid-math library. Tasmanian is the gold standard for grid math; bellgrid is a higher-level DP solver that uses multilinear interpolation on regular and warped grids.
 - A domain-specific library for any one application. Utility theory, options theory, inventory theory, control theory — bellgrid is the common substrate. Domain primitives live in the example notebooks where they belong.
 - An advice / planning product. Solvers compute optimal policies given a reward and constraints. Applying that to a real person's life is a separate, regulated activity.
