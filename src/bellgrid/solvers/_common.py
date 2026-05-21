@@ -386,6 +386,12 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
         ctx.state_b_dict, ctx.action_b, ctx.shock_dict_b, t
     )
 
+    # Build per-axis lookup queries. When a markov chain is present we
+    # extend each non-markov query by a kept (n_m,) dim at the end via
+    # unsqueeze + expand + contiguous: expand alone produces a stride-0
+    # view that torch.searchsorted has to materialise anyway (it warns
+    # about the implicit copy), so we materialise it ourselves at the
+    # call site where the cost is visible.
     queries = []
     for name, kind, transform in zip(
         ctx.state_names, ctx.state_kinds, ctx.transforms
@@ -401,7 +407,7 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
             nv = nv.broadcast_to(ctx.full_shape).contiguous()
             u_next = transform(nv)
             if ctx.K_mc == 1:
-                u_next = u_next.unsqueeze(-1).expand(ctx.lookup_shape)
+                u_next = u_next.unsqueeze(-1).expand(ctx.lookup_shape).contiguous()
             queries.append(u_next)
         elif kind == "discrete":
             if name not in next_state_dict:
@@ -413,7 +419,7 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
             )
             nv = nv.broadcast_to(ctx.full_shape).contiguous()
             if ctx.K_mc == 1:
-                nv = nv.unsqueeze(-1).expand(ctx.lookup_shape)
+                nv = nv.unsqueeze(-1).expand(ctx.lookup_shape).contiguous()
             queries.append(nv)
         else:  # markov — solver-controlled
             if name in next_state_dict:
@@ -423,7 +429,9 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
                 )
             arange = torch.arange(ctx.n_m, dtype=torch.long, device=ctx.device)
             view_arange = [1] * len(ctx.full_shape) + [ctx.n_m]
-            arange_b = arange.view(view_arange).expand(ctx.lookup_shape)
+            # As above: materialise the broadcast view so multilinear's
+            # downstream gather has contiguous indices.
+            arange_b = arange.view(view_arange).expand(ctx.lookup_shape).contiguous()
             queries.append(arange_b)
 
     V_lookup = multilinear(ctx.axes_for_lookup, V_next, queries)
