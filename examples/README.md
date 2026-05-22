@@ -43,6 +43,17 @@ or run the source `.py` files directly.
   retirement boundary $w^*(t)$ falling from ~31 at age 0 to ~6 near
   the end of the horizon, plus a 500-path forward simulation of the
   accumulation → retirement → decumulation pattern.
+- `09_lifecycle_planning/lifecycle_planning.ipynb` — the **full
+  lifecycle problem** that motivated bellgrid. Ages 25-100,
+  consumption + retirement + asset-allocation decisions, mortality,
+  warm-glow bequest, deterministic age-earnings profile, and a
+  6-state regime-switching market. Exercises every major primitive
+  added in 0.1.0a2: callable discount (for the mortality
+  continuation), next-state-aware reward (for the per-period
+  bequest), `MarkovChain` (regime), `DiscreteState` (working/retired
+  phase), and state-dependent action bounds on a multi-D continuous
+  state. Helpers in sibling files (`mortality.py`, `utility.py`,
+  `wages.py`, `regimes.py`) — adapted from the rl-inv2 project.
 - `08_jump_diffusion_option/jump_diffusion_option.ipynb` — American
   put under **Merton (1976) jump-diffusion**: standard GBM diffusion
   plus rare downward jumps. First multi-shock example: pairs a
