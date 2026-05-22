@@ -2,7 +2,22 @@
 
 **Solve stochastic dynamic programs on the GPU.** Mixed continuous and discrete state, mixed continuous and discrete action, exact via backward induction.
 
-bellgrid is for the case where you *have* a model — a transition, a reward, a discount factor — and want the optimal policy across the entire state space. Not approximate. Not on-distribution. Not after a week of RL tuning. Declare a `Problem`, pick a state mesh, and get back a policy you can query at any point in the support.
+A bellgrid `Problem` specifies:
+
+- a **state** `s` and **action** `a`, each a tuple of continuous-real components and/or discrete-categorical components (including Markov-chain indices) in any combination;
+- a **transition** `s' = f(s, a, w, t)` mapping a current state, action, shock realisation, and time index to a next state;
+- a **per-period reward** `r(s, a, w, t)` (optionally also a function of `s'`);
+- a **shock distribution** `w ~ p` — Normal, Lognormal, MultivariateNormal, Uniform, Categorical, or Jump, individually or jointly via tensor product;
+- a **discount** `β(s, t)` (scalar or callable);
+- a **planning horizon** `t ∈ {0, 1, …, T}` (finite) or `t = ∞` (stationary).
+
+bellgrid solves the [Bellman recursion](https://en.wikipedia.org/wiki/Bellman_equation)
+
+```
+V_t(s) = max_a  E_w[ r(s, a, w, t) + β(s, t) · V_{t+1}( f(s, a, w, t) ) ]
+```
+
+over a user-chosen state mesh, evaluating the shock expectation by quadrature appropriate to the shock type — Gauss-Hermite for `Normal` and `Lognormal`, Cholesky-rotated tensor-product Gauss-Hermite for `MultivariateNormal`, Gauss-Legendre for `Uniform`, exact for `Categorical`, Bernoulli arrival + Gauss-Hermite over magnitude for `Jump` — and interpolating `V_{t+1}` multilinearly at next-state coordinates. Finite-horizon problems sweep backward from a user-supplied terminal `V_T(s)`; infinite-horizon problems iterate to convergence under a stationary policy.
 
 Every example in this repo is validated against an analytical or numerical reference: log-utility Merton matches the closed form to machine precision, the LQG case bit-for-bit matches the Riccati recursion, the American put matches a high-resolution binomial tree to ~1e-4, Merton (1976) jump-diffusion matches the series expansion to ~1e-3.
 
