@@ -22,7 +22,10 @@ from dataclasses import dataclass
 import torch
 
 from ..problem import Problem
-from ._common import _Policy, _Value, bellman_step, setup_solve, terminal_value
+from ._common import (
+    _Policy, _Value, bellman_step, check_boundary_escape, setup_solve,
+    terminal_value,
+)
 
 
 @dataclass(frozen=True)
@@ -64,7 +67,7 @@ def _policy_iteration(
 
     ctx = setup_solve(
         problem, state_grid, action_grid, solver.n_quad,
-        device=device, dtype=dtype,
+        device=device, dtype=dtype, chunk_size=chunk_size,
     )
 
     V = terminal_value(ctx)
@@ -82,6 +85,9 @@ def _policy_iteration(
             f"PolicyIteration did not converge in {solver.max_iters} iterations "
             f"(final ||ΔV||_∞ = {delta:.3e}, target {solver.tol:.3e})"
         )
+
+    # Boundary diagnostic on the converged stationary policy.
+    check_boundary_escape(ctx, policy_now, t=None)
 
     # Store under key None so policy(state, t=None) and value(state, t=None)
     # work uniformly with the finite-horizon API.

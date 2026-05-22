@@ -11,7 +11,10 @@ from dataclasses import dataclass
 import torch
 
 from ..problem import Problem
-from ._common import _Policy, _Value, bellman_step, setup_solve, terminal_value
+from ._common import (
+    _Policy, _Value, bellman_step, check_boundary_escape, setup_solve,
+    terminal_value,
+)
 
 
 @dataclass(frozen=True)
@@ -45,17 +48,26 @@ def _backward_induction(
 
     ctx = setup_solve(
         problem, state_grid, action_grid, solver.n_quad,
-        device=device, dtype=dtype,
+        device=device, dtype=dtype, chunk_size=chunk_size,
     )
 
     V_next = terminal_value(ctx)
     V_by_t: dict = {}
     policy_by_t: dict = {}
+    last_t = None
+    last_policy: dict = {}
     for t in reversed(list(problem.horizon)):
         V_now, pol_now = bellman_step(ctx, V_next, t)
         V_by_t[t] = V_now
         policy_by_t[t] = pol_now
         V_next = V_now
+        last_t = t
+        last_policy = pol_now
+
+    # Boundary diagnostic on the final (earliest-t) optimal policy. The
+    # boundary issue is usually consistent across t so one check is enough.
+    if last_policy:
+        check_boundary_escape(ctx, last_policy, last_t)
 
     return (
         _Policy(

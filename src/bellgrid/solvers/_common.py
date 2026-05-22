@@ -8,6 +8,8 @@ markov matrix contraction — is identical, lives here, and is shared
 via the ``SolveContext`` dataclass that bundles up the broadcast arrays.
 """
 
+import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -95,6 +97,14 @@ class SolveContext:
     dtype: torch.dtype
     device: Any
 
+    # Soft cap on per-Bellman-step memory: at most this many tensor elements
+    # in any intermediate. The Bellman update chunks the shock axis so each
+    # chunk stays under the cap (well, modulo a few constant-size temporaries).
+    chunk_size: int = 2**20
+
+    # Continuous-state range cache, used by the boundary diagnostic.
+    state_ranges: dict = field(default_factory=dict)
+
 
 def setup_solve(
     problem: Problem,
@@ -104,6 +114,7 @@ def setup_solve(
     *,
     device,
     dtype: torch.dtype,
+    chunk_size: int = 2**20,
 ) -> SolveContext:
     """Build a ``SolveContext`` from the problem and grid specs."""
     # ---- scope checks ---------------------------------------------------
@@ -333,6 +344,12 @@ def setup_solve(
         matrix_b = None
         n_m = 0
 
+    state_ranges = {
+        s.name: tuple(s.range)
+        for s in problem.states
+        if isinstance(s, ContinuousState)
+    }
+
     return SolveContext(
         problem=problem,
         discount=discount,
@@ -356,6 +373,8 @@ def setup_solve(
         shock_dict_b=shock_dict_b,
         weights_b=weights_b,
         n_m=n_m,
+        chunk_size=chunk_size,
+        state_ranges=state_ranges,
         matrix_b=matrix_b,
         dtype=dtype,
         device=device,
@@ -372,28 +391,43 @@ def terminal_value(ctx: SolveContext) -> torch.Tensor:
     ).contiguous()
 
 
-def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tensor, dict]:
-    """One Bellman update.
+def _bellman_partial(
+    ctx: SolveContext,
+    V_next: torch.Tensor,
+    t,
+    q_start: int,
+    q_end: int,
+) -> torch.Tensor:
+    """Contribution of shock nodes ``[q_start, q_end)`` to ``Σ_q (r + γ V) · w``.
 
-    Returns ``(V_now, policy_now)`` where ``V_now`` has shape
-    ``state_dims_tup`` and ``policy_now`` is a dict of optimal action
-    tensors with the same shape.
+    Returns a ``state_dims + (N_a,)``-shaped tensor: the partial Bellman
+    integrand summed over the slice of shock nodes. Callers concatenate
+    the partials by summing across all shock-slice calls, then take the
+    max over the action axis.
     """
-    r = ctx.problem.reward(ctx.state_b_dict, ctx.action_b, ctx.shock_dict_b, t)
+    n_q = q_end - q_start
+    chunk_shape = ctx.state_dims_tup + (ctx.N_a, n_q)
+
+    # Slice the expanded views along the shock axis. Each view stays a
+    # view (no allocation) since slicing along an existing axis is just
+    # an offset + size change.
+    state_b = {name: x[..., q_start:q_end] for name, x in ctx.state_b_dict.items()}
+    action_b = {name: x[..., q_start:q_end] for name, x in ctx.action_b.items()}
+    shock_b = {name: x[..., q_start:q_end] for name, x in ctx.shock_dict_b.items()}
+    weights_b = ctx.weights_b[..., q_start:q_end]
+
+    r = ctx.problem.reward(state_b, action_b, shock_b, t)
     r = torch.as_tensor(r, dtype=ctx.dtype, device=ctx.device).broadcast_to(
-        ctx.full_shape
+        chunk_shape
     ).contiguous()
 
-    next_state_dict = ctx.problem.transition(
-        ctx.state_b_dict, ctx.action_b, ctx.shock_dict_b, t
-    )
+    next_state_dict = ctx.problem.transition(state_b, action_b, shock_b, t)
 
-    # Build per-axis lookup queries. When a markov chain is present we
-    # extend each non-markov query by a kept (n_m,) dim at the end via
-    # unsqueeze + expand + contiguous: expand alone produces a stride-0
-    # view that torch.searchsorted has to materialise anyway (it warns
-    # about the implicit copy), so we materialise it ourselves at the
-    # call site where the cost is visible.
+    if ctx.K_mc == 1:
+        lookup_shape = chunk_shape + (ctx.n_m,)
+    else:
+        lookup_shape = chunk_shape
+
     queries = []
     for name, kind, transform in zip(
         ctx.state_names, ctx.state_kinds, ctx.transforms
@@ -406,10 +440,10 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
             nv = torch.as_tensor(
                 next_state_dict[name], dtype=ctx.dtype, device=ctx.device
             )
-            nv = nv.broadcast_to(ctx.full_shape).contiguous()
+            nv = nv.broadcast_to(chunk_shape).contiguous()
             u_next = transform(nv)
             if ctx.K_mc == 1:
-                u_next = u_next.unsqueeze(-1).expand(ctx.lookup_shape).contiguous()
+                u_next = u_next.unsqueeze(-1).expand(lookup_shape).contiguous()
             queries.append(u_next)
         elif kind == "discrete":
             if name not in next_state_dict:
@@ -419,9 +453,9 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
             nv = torch.as_tensor(
                 next_state_dict[name], dtype=torch.long, device=ctx.device
             )
-            nv = nv.broadcast_to(ctx.full_shape).contiguous()
+            nv = nv.broadcast_to(chunk_shape).contiguous()
             if ctx.K_mc == 1:
-                nv = nv.unsqueeze(-1).expand(ctx.lookup_shape).contiguous()
+                nv = nv.unsqueeze(-1).expand(lookup_shape).contiguous()
             queries.append(nv)
         else:  # markov — solver-controlled
             if name in next_state_dict:
@@ -430,21 +464,51 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
                     "(advanced via its transition matrix)"
                 )
             arange = torch.arange(ctx.n_m, dtype=torch.long, device=ctx.device)
-            view_arange = [1] * len(ctx.full_shape) + [ctx.n_m]
-            # As above: materialise the broadcast view so multilinear's
-            # downstream gather has contiguous indices.
-            arange_b = arange.view(view_arange).expand(ctx.lookup_shape).contiguous()
+            view_arange = [1] * len(chunk_shape) + [ctx.n_m]
+            arange_b = arange.view(view_arange).expand(lookup_shape).contiguous()
             queries.append(arange_b)
 
     V_lookup = multilinear(ctx.axes_for_lookup, V_next, queries)
 
     if ctx.K_mc == 1:
+        # matrix_b has size-1 in the shock dim, so it broadcasts cleanly
+        # across the chunked shock slice — no re-shape needed.
         V_at_next = (V_lookup * ctx.matrix_b).sum(dim=-1)
     else:
         V_at_next = V_lookup
 
     integrand = r + ctx.discount * V_at_next
-    bellman = (integrand * ctx.weights_b).sum(dim=-1)
+    return (integrand * weights_b).sum(dim=-1)
+
+
+def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tensor, dict]:
+    """One Bellman update.
+
+    Returns ``(V_now, policy_now)`` where ``V_now`` has shape
+    ``state_dims_tup`` and ``policy_now`` is a dict of optimal action
+    tensors with the same shape.
+
+    The shock axis is chunked so that no intermediate tensor exceeds
+    roughly ``ctx.chunk_size`` elements. For small problems the chunk
+    spans the entire shock axis and the loop is a single iteration; for
+    larger problems we accumulate the Bellman expectation across chunks.
+    """
+    state_count = (
+        math.prod(ctx.state_dims_tup) if ctx.state_dims_tup else 1
+    )
+    elements_per_shock = state_count * ctx.N_a
+    chunk_n_q = max(1, ctx.chunk_size // max(elements_per_shock, 1))
+
+    if chunk_n_q >= ctx.N_q:
+        bellman = _bellman_partial(ctx, V_next, t, 0, ctx.N_q)
+    else:
+        bellman = torch.zeros(
+            ctx.state_dims_tup + (ctx.N_a,),
+            dtype=ctx.dtype, device=ctx.device,
+        )
+        for q_start in range(0, ctx.N_q, chunk_n_q):
+            q_end = min(q_start + chunk_n_q, ctx.N_q)
+            bellman = bellman + _bellman_partial(ctx, V_next, t, q_start, q_end)
 
     V_now, argmax = bellman.max(dim=-1)
     policy_now = {
@@ -452,6 +516,120 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
         for name, tensor in ctx.action_tensors.items()
     }
     return V_now, policy_now
+
+
+_BOUNDARY_ESCAPE_THRESHOLD = 0.10  # interior-mean across the state mesh
+_BOUNDARY_INTERIOR_FRACTION = 0.10  # exclude this much of the outer mesh on each side per axis
+
+
+def check_boundary_escape(
+    ctx: SolveContext, policy_actions: dict, t,
+    threshold: float = _BOUNDARY_ESCAPE_THRESHOLD,
+    interior_fraction: float = _BOUNDARY_INTERIOR_FRACTION,
+) -> dict:
+    """Diagnose how much of next-state probability mass lands outside each
+    continuous state's grid range under the optimal policy.
+
+    Runs one extra ``problem.transition`` call with the optimal action
+    plugged in for every state, then for each ContinuousState computes
+    the shock-weighted fraction of next-states that fall outside ``[low,
+    high]``. Returns a ``{name: {"max": fraction, "interior_mean":
+    fraction}}`` dict. Emits a ``UserWarning`` for each state whose
+    ``interior_mean`` exceeds ``threshold`` (default 10%).
+
+    Why an **interior** mean: the literal grid-edge cell always overshoots
+    100% of the time under any positive shock, but those cells are rarely
+    visited in practice — a well-configured problem can have ~5% of its
+    mesh "boundary-affected" purely from the topmost grid points and be
+    completely fine. We exclude the outer ``interior_fraction`` of each
+    continuous axis (default 10% on each side per axis) before averaging,
+    so the diagnostic measures "is the boundary biting *interior* states
+    the agent actually inhabits". (Without an explicit state distribution
+    this is the best cheap proxy.)
+
+    Multilinear clamps overshoot to the grid edge, which underestimates V
+    in concave regions and biases the Bellman optimisation (we shipped
+    two real bugs of this shape in the Merton and LQG examples before
+    this check existed).
+    """
+    if not ctx.state_ranges:
+        return {}
+
+    state_dims = ctx.state_dims_tup
+    N_q = ctx.N_q
+    diagnostic_shape = state_dims + (N_q,)
+
+    state_b = {
+        name: m.reshape(state_dims + (1,)).expand(diagnostic_shape)
+        for name, m in ctx.state_meshes_dict.items()
+    }
+    action_b = {
+        name: tensor.unsqueeze(-1).expand(diagnostic_shape)
+        for name, tensor in policy_actions.items()
+    }
+    shock_b = {
+        name: x.select(-2, 0)  # state_dims + (N_q,)
+        for name, x in ctx.shock_dict_b.items()
+    }
+    weights = ctx.weights_b.select(-2, 0)  # (1,)*K + (N_q,)
+
+    next_state_dict = ctx.problem.transition(state_b, action_b, shock_b, t)
+
+    # Build an interior mask: True for cells away from the edge of every
+    # continuous axis. Discrete and markov axes don't contribute (they're
+    # never "outside" since they're enumerated).
+    interior_mask = torch.ones(state_dims, dtype=torch.bool, device=ctx.device)
+    for k, kind in enumerate(ctx.state_kinds):
+        if kind != "continuous":
+            continue
+        n_k = state_dims[k]
+        cut = max(1, int(round(n_k * interior_fraction)))
+        # Indices [cut, n_k - cut) are "interior" along axis k.
+        axis_mask = torch.zeros(n_k, dtype=torch.bool, device=ctx.device)
+        if n_k - 2 * cut > 0:
+            axis_mask[cut : n_k - cut] = True
+        else:
+            axis_mask[:] = True  # axis too small to meaningfully trim
+        # Broadcast onto state_dims
+        view_shape = [1] * len(state_dims)
+        view_shape[k] = n_k
+        interior_mask = interior_mask & axis_mask.view(view_shape)
+
+    interior_count = interior_mask.sum().item()
+    if interior_count == 0:
+        return {}
+
+    stats: dict = {}
+    for name, (low, high) in ctx.state_ranges.items():
+        nv = torch.as_tensor(
+            next_state_dict[name], dtype=ctx.dtype, device=ctx.device
+        ).broadcast_to(diagnostic_shape)
+        outside = (nv < low) | (nv > high)
+        per_state = (outside.to(ctx.dtype) * weights).sum(dim=-1)  # state_dims
+        # interior_mean excludes outer cells; max stays over the whole mesh.
+        interior_sum = (per_state * interior_mask.to(ctx.dtype)).sum().item()
+        stats[name] = {
+            "max": float(per_state.max().item()),
+            "interior_mean": float(interior_sum / interior_count),
+            "mean": float(per_state.mean().item()),
+        }
+
+    for name, s in stats.items():
+        if s["interior_mean"] > threshold:
+            low, high = ctx.state_ranges[name]
+            warnings.warn(
+                f"bellgrid: under the optimal policy, state {name!r} has an "
+                f"average of {s['interior_mean']*100:.1f}% of probability "
+                f"mass landing outside its grid range [{low}, {high}] across "
+                f"the interior of the state mesh (worst-cell escape is "
+                f"{s['max']*100:.1f}%). Multilinear interpolation clamps to "
+                f"the edge there, which biases V — consider widening the "
+                f"state's range.",
+                UserWarning,
+                stacklevel=3,
+            )
+
+    return stats
 
 
 def _build_queries(
