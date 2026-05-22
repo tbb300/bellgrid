@@ -1,0 +1,90 @@
+# Release workflow: triggered by pushing a `v*` tag.
+#
+# Builds the package, publishes it to PyPI via Trusted Publishing
+# (OIDC — no API token required), and creates a GitHub Release whose
+# body is extracted from the matching section of CHANGELOG.md.
+#
+# To release a new version:
+#   1. Bump version in pyproject.toml and src/bellgrid/__init__.py
+#   2. Add a new "## [X.Y.Z] — YYYY-MM-DD" section to CHANGELOG.md
+#   3. Commit + push to main
+#   4. `git tag -a vX.Y.Z -m "Release X.Y.Z"`
+#   5. `git push origin vX.Y.Z`
+#
+# This workflow takes it from there.
+#
+# One-time setup (already done; documented for future maintainers):
+#   - PyPI: https://pypi.org/manage/project/bellgrid/settings/publishing/
+#     Add a GitHub trusted publisher with:
+#       Owner:      tbb300
+#       Repository: bellgrid
+#       Workflow:   release.yml
+#       Environment: (leave blank)
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Required for Trusted Publishing (OIDC) and for creating the GitHub
+# Release. Both are scoped to this workflow only.
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install 3.13
+
+      - name: Verify tag matches pyproject version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PYPROJECT_VERSION=$(grep -E '^version\s*=' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match pyproject version ($PYPROJECT_VERSION)"
+            exit 1
+          fi
+          echo "Releasing $TAG_VERSION"
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Publish to PyPI (Trusted Publishing)
+        run: uv publish --trusted-publishing always
+
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pull lines between "## [VERSION]" and the next "## [" header.
+          NOTES=$(awk -v v="$VERSION" '
+            $0 ~ "^## \\["v"\\]" { flag = 1; next }
+            $0 ~ "^## \\[" && flag { flag = 0 }
+            flag { print }
+          ' CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            echo "::warning::No CHANGELOG.md section found for $VERSION; release will have no body"
+            NOTES="No release notes — see commit history."
+          fi
+          # Write to a file so multiline content survives shell expansion
+          printf '%s\n' "$NOTES" > /tmp/release_notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "${GITHUB_REF_NAME#v}" \
+            --notes-file /tmp/release_notes.md \
+            dist/*
