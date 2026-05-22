@@ -463,9 +463,12 @@ def _bellman_partial(
     action_b = {name: x[..., q_start:q_end] for name, x in ctx.action_b.items()}
     shock_b = {name: x[..., q_start:q_end] for name, x in ctx.shock_dict_b.items()}
     weights_b = ctx.weights_b[..., q_start:q_end]
-    if isinstance(discount, torch.Tensor):
+    if isinstance(discount, torch.Tensor) and discount.ndim == len(ctx.full_shape):
+        # Full-shape discount tensor — slice along the shock axis for this chunk.
         discount_chunk = discount[..., q_start:q_end]
     else:
+        # Scalar tensor, smaller-shape tensor, or plain Python scalar —
+        # broadcasts naturally in ``r + discount_chunk * V_at_next`` below.
         discount_chunk = discount
 
     # Always evaluate the transition first — its output may be needed by a
@@ -511,16 +514,20 @@ def _bellman_partial(
         r = ctx.problem.reward(state_b, action_b, shock_b, t, next_state_dict)
     else:
         r = ctx.problem.reward(state_b, action_b, shock_b, t)
-    r = torch.as_tensor(r, dtype=ctx.dtype, device=ctx.device).broadcast_to(
-        chunk_shape
-    ).contiguous()
+    # Keep r in its natural shape; downstream arithmetic broadcasts.
+    r = torch.as_tensor(r, dtype=ctx.dtype, device=ctx.device)
 
     # Build the lookup tensor shape. With K_mc markov chains, the lookup
     # has one extra "kept" axis per chain, appended in chain order.
     lookup_shape = chunk_shape + tuple(ctx.n_ms)
 
+    # Build the multilinear queries. We *don't* materialise the expanded
+    # views — multilinear's internal ops handle non-contiguous queries,
+    # and skipping the .contiguous() saves a large per-step memory
+    # allocation (in the lifecycle case, ~770 MB per query × 3 queries =
+    # 2.3 GB / period not written to GPU memory).
     queries = []
-    mc_idx = 0  # which markov chain (in canonical order) we're on
+    mc_idx = 0
     for name, kind, transform in zip(
         ctx.state_names, ctx.state_kinds, ctx.transforms
     ):
@@ -528,32 +535,29 @@ def _bellman_partial(
             nv = torch.as_tensor(
                 next_state_dict[name], dtype=ctx.dtype, device=ctx.device
             )
-            nv = nv.broadcast_to(chunk_shape).contiguous()
+            nv = nv.broadcast_to(chunk_shape)
             u_next = transform(nv)
             if ctx.K_mc >= 1:
-                # Extend by K_mc trailing 1-dims, then expand to lookup_shape.
                 for _ in range(ctx.K_mc):
                     u_next = u_next.unsqueeze(-1)
-                u_next = u_next.expand(lookup_shape).contiguous()
+                u_next = u_next.expand(lookup_shape)
             queries.append(u_next)
         elif kind == "discrete":
             nv = torch.as_tensor(
                 next_state_dict[name], dtype=torch.long, device=ctx.device
             )
-            nv = nv.broadcast_to(chunk_shape).contiguous()
+            nv = nv.broadcast_to(chunk_shape)
             if ctx.K_mc >= 1:
                 for _ in range(ctx.K_mc):
                     nv = nv.unsqueeze(-1)
-                nv = nv.expand(lookup_shape).contiguous()
+                nv = nv.expand(lookup_shape)
             queries.append(nv)
         else:  # markov — solver-controlled
             n_mk = ctx.n_ms[mc_idx]
             arange = torch.arange(n_mk, dtype=torch.long, device=ctx.device)
-            # This chain's kept axis is at position len(chunk_shape) + mc_idx
-            # in the lookup shape; all other axes are size 1 for this query.
             view_arange = [1] * len(lookup_shape)
             view_arange[len(chunk_shape) + mc_idx] = n_mk
-            arange_b = arange.view(view_arange).expand(lookup_shape).contiguous()
+            arange_b = arange.view(view_arange).expand(lookup_shape)
             queries.append(arange_b)
             mc_idx += 1
 
@@ -586,14 +590,14 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
     larger problems we accumulate the Bellman expectation across chunks.
     """
     # Pre-compute the discount once per Bellman step — same across all
-    # shock-slice chunks. Scalar discounts stay scalar; callable discounts
-    # are materialised to ``full_shape`` so chunked slicing works
-    # uniformly.
+    # shock-slice chunks. We keep it in whatever natural shape the user
+    # returned (scalar tensors stay scalar; state-dependent tensors stay
+    # at their natural shape). Broadcasting in the Bellman arithmetic
+    # below handles all the shape variants without us having to
+    # materialise to ``full_shape``.
     if callable(ctx.discount):
         disc_raw = ctx.discount(ctx.state_b_dict, t)
-        discount = torch.as_tensor(
-            disc_raw, dtype=ctx.dtype, device=ctx.device
-        ).broadcast_to(ctx.full_shape).contiguous()
+        discount = torch.as_tensor(disc_raw, dtype=ctx.dtype, device=ctx.device)
     else:
         discount = ctx.discount
 
