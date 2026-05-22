@@ -7,8 +7,8 @@
 ## Quick start
 
 ```bash
-git clone https://github.com/tbb300/bellgrid && cd bellgrid
-uv sync --extra examples
+pip install bellgrid                                                # CPU-only torch from PyPI
+pip install bellgrid --extra-index-url https://download.pytorch.org/whl/cu126   # GPU
 ```
 
 A minimal Merton consumption-portfolio (log utility, single risky asset, lognormal returns):
@@ -59,18 +59,18 @@ Reward is whatever scalar callable matches your problem: utility maximization, c
 
 ## Examples
 
-Eight canonical problems, each validated against an analytical or numerical reference. Open the `.ipynb` files in JupyterLab or [view them on GitHub](examples/).
+Eight canonical problems, each validated against an analytical or numerical reference. Open the `.ipynb` files in JupyterLab or [view them on GitHub](https://github.com/tbb300/bellgrid/tree/main/examples).
 
 | Notebook | Problem | Validates against |
 |---|---|---|
-| [`01_merton`](examples/01_merton/merton.ipynb) | Log-utility Merton consumption-portfolio | Closed form `V = A + B log w`, `c/w = 1 − β` |
-| [`02_carroll_deaton`](examples/02_carroll_deaton/carroll_deaton.ipynb) | CRRA lifecycle savings with a borrowing constraint | Endogenous Grid Method (Carroll 2006) |
-| [`03_american_option`](examples/03_american_option/american_option.ipynb) | American put on GBM | CRR binomial tree (n=2000), agreement within ~1e-4 |
-| [`04_lqg`](examples/04_lqg/lqg.ipynb) | 2-D linear-quadratic-Gaussian control | Discrete-time Riccati recursion |
-| [`05_two_asset_merton`](examples/05_two_asset_merton/two_asset_merton.ipynb) | 2-asset Merton with correlated returns (`MultivariateNormal`) | Numerical FOC for the optimal portfolio share |
-| [`06_regime_switching_option`](examples/06_regime_switching_option/regime_switching_option.ipynb) | American put under regime-switching vol (`MarkovChain`) | Bracketed by constant-vol references at σ_low, σ_high, σ_stationary |
-| [`07_retirement_decision`](examples/07_retirement_decision/retirement_decision.ipynb) | Lifecycle work vs retire decision (`DiscreteState`, irreversible) | Qualitative — boundary falls with age, accumulate → retire → decumulate dynamics |
-| [`08_jump_diffusion_option`](examples/08_jump_diffusion_option/jump_diffusion_option.ipynb) | American put under Merton (1976) jump-diffusion (`Jump` + `Normal`, multi-shock) | European case validated against Merton 1976 series expansion (agreement within ~1e-3); American case shows the jump premium and lower exercise boundary |
+| [`01_merton`](https://github.com/tbb300/bellgrid/blob/main/examples/01_merton/merton.ipynb) | Log-utility Merton consumption-portfolio | Closed form `V = A + B log w`, `c/w = 1 − β` |
+| [`02_carroll_deaton`](https://github.com/tbb300/bellgrid/blob/main/examples/02_carroll_deaton/carroll_deaton.ipynb) | CRRA lifecycle savings with a borrowing constraint | Endogenous Grid Method (Carroll 2006) |
+| [`03_american_option`](https://github.com/tbb300/bellgrid/blob/main/examples/03_american_option/american_option.ipynb) | American put on GBM | CRR binomial tree (n=2000), agreement within ~1e-4 |
+| [`04_lqg`](https://github.com/tbb300/bellgrid/blob/main/examples/04_lqg/lqg.ipynb) | 2-D linear-quadratic-Gaussian control | Discrete-time Riccati recursion |
+| [`05_two_asset_merton`](https://github.com/tbb300/bellgrid/blob/main/examples/05_two_asset_merton/two_asset_merton.ipynb) | 2-asset Merton with correlated returns (`MultivariateNormal`) | Numerical FOC for the optimal portfolio share |
+| [`06_regime_switching_option`](https://github.com/tbb300/bellgrid/blob/main/examples/06_regime_switching_option/regime_switching_option.ipynb) | American put under regime-switching vol (`MarkovChain`) | Bracketed by constant-vol references at σ_low, σ_high, σ_stationary |
+| [`07_retirement_decision`](https://github.com/tbb300/bellgrid/blob/main/examples/07_retirement_decision/retirement_decision.ipynb) | Lifecycle work vs retire decision (`DiscreteState`, irreversible) | Qualitative — boundary falls with age, accumulate → retire → decumulate dynamics |
+| [`08_jump_diffusion_option`](https://github.com/tbb300/bellgrid/blob/main/examples/08_jump_diffusion_option/jump_diffusion_option.ipynb) | American put under Merton (1976) jump-diffusion (`Jump` + `Normal`, multi-shock) | European case validated against Merton 1976 series expansion (agreement within ~1e-3); American case shows the jump premium and lower exercise boundary |
 
 Each notebook opens with the problem statement and equations, then runs bellgrid against the reference side-by-side.
 
@@ -101,7 +101,7 @@ You have (or can write) a transition model, state is roughly 1–6 continuous di
 | Off-policy what-ifs | Cheap recompute | Full retrain |
 | You don't have a model | Doesn't apply | Where RL wins |
 
-Longer version with concrete borderline cases in [`docs/when_to_use.md`](docs/when_to_use.md); full API surface in [`docs/api.md`](docs/api.md).
+Longer version with concrete borderline cases in [`docs/when_to_use.md`](https://github.com/tbb300/bellgrid/blob/main/docs/when_to_use.md); full API surface in [`docs/api.md`](https://github.com/tbb300/bellgrid/blob/main/docs/api.md).
 
 ## License
 

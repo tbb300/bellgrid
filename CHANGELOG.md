@@ -4,6 +4,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/) — the leading `0.`
 indicates the API may still change in non-additive ways before a `1.0` release.
 
+## [0.1.0a1] — 2026-05-22
+
+PyPI-rendered README fix: relative links to `examples/` and `docs/` in the
+README don't resolve on the PyPI project page (they only work on GitHub's
+file-tree rendering). Rewrote all of them as absolute GitHub URLs so the
+PyPI page lands correctly. Also added a `pip install bellgrid` quick-start
+since the alpha is now on PyPI. No code changes.
+
 ## [0.1.0a0] — 2026-05-21
 
 First alpha release. The library has eight validated example notebooks, ~200
@@ -76,4 +84,5 @@ collecting feedback.
 - No infinite-horizon `MarkovChain` initial-state defaulting to the stationary
   distribution in `simulate()` (users pass an explicit category index for now).
 
+[0.1.0a1]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a1
 [0.1.0a0]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a0
