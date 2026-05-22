@@ -4,6 +4,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/) — the leading `0.`
 indicates the API may still change in non-additive ways before a `1.0` release.
 
+## [0.1.0a3] — 2026-05-22
+
+No API changes. Ships the **full lifecycle planning example**, four
+test files filling coverage gaps surfaced by an internal review, and
+a tokenless release workflow.
+
+### Added
+- **`examples/09_lifecycle_planning/`** — the canonical lifecycle DP
+  problem that motivated bellgrid: an agent from age 25 to 100
+  choosing consumption, retirement age, and equity share under
+  mortality, regime-switching markets, a deterministic age-earnings
+  profile, and a warm-glow bequest motive. Exercises callable
+  discount + next-state-aware reward + MarkovChain + DiscreteState +
+  state-dependent bounds in one problem. Helpers in `mortality.py`,
+  `utility.py`, `wages.py`, `regimes.py` — adapted from the rl-inv2
+  project.
+- **Coverage-gap tests** (16 new) addressing the post-0.1.0a2 review:
+  - `test_simulate_with_categorical_uniform.py` — Categorical /
+    Uniform shocks in `simulate()`, with 5σ empirical-distribution
+    checks.
+  - `test_three_markov_chains.py` — 3 and 4 independent
+    MarkovChains; 4-chain Kronecker-product equivalence vs a single
+    16-state MarkovChain.
+  - `test_markov_callable_combo.py` — callable discount sees the
+    current regime; 5-arg reward's `next_state` excludes MC keys;
+    end-to-end combo with hand-derived analytic V (V_r1 = 2.5x).
+  - `test_boundary_with_markov_chain.py` — boundary diagnostic with
+    stochastic + regime-dependent dynamics; no spurious warning on
+    clean MC problems; opt-out works.
+- **`.github/workflows/release.yml`** — GitHub Actions workflow that
+  publishes to PyPI via Trusted Publishing (OIDC) on `v*` tag push,
+  with the GitHub Release body auto-extracted from the matching
+  CHANGELOG section. No API tokens required.
+
+### Test count
+- 271 tests pass (up from 255 in 0.1.0a2).
+
 ## [0.1.0a2] — 2026-05-22
 
 Substantial alpha-2: two new shocks, two solver-side capabilities, three
@@ -164,6 +201,7 @@ collecting feedback.
 - No infinite-horizon `MarkovChain` initial-state defaulting to the stationary
   distribution in `simulate()` (users pass an explicit category index for now).
 
+[0.1.0a3]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a3
 [0.1.0a2]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a2
 [0.1.0a1]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a1
 [0.1.0a0]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a0
