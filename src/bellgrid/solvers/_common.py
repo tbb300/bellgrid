@@ -24,12 +24,14 @@ from ..problem import (
     MarkovChain,
     Problem,
 )
+from ..shocks.categorical import Categorical
 from ..shocks.jump import Jump
 from ..shocks.lognormal import Lognormal
 from ..shocks.multivariate_normal import MultivariateNormal
 from ..shocks.normal import Normal
+from ..shocks.uniform import Uniform
 
-_SUPPORTED_SHOCKS = (Normal, Lognormal, MultivariateNormal, Jump)
+_SUPPORTED_SHOCKS = (Normal, Lognormal, MultivariateNormal, Jump, Categorical, Uniform)
 _SUPPORTED_ACTIONS = (ContinuousAction, DiscreteAction)
 _SUPPORTED_STATES = (ContinuousState, DiscreteState, MarkovChain)
 _SUPPORTED_GRIDS = (RegularGrid, WarpedGrid)

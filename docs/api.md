@@ -49,18 +49,23 @@ Bounds can reference state variables. In `policy(state, t)` outputs, continuous 
 Shocks in bellgrid are *iid innovations*. Persistent processes (AR(1), GARCH, ...) belong in state — see [Persistent shocks](#persistent-shocks) below. Markov-chain dynamics belong in state too — see `MarkovChain` above.
 
 ```python
-from bellgrid.shocks import Normal, MultivariateNormal, Lognormal
-# from bellgrid.shocks import Jump   # planned
+from bellgrid.shocks import (
+    Normal, Lognormal, MultivariateNormal,
+    Uniform, Categorical, Jump,
+)
 
-equity_shock = Normal("equity", sigma=0.18)         # sigma defaults to 1.0 (standard normal)
+equity_shock = Normal("equity", sigma=0.18)        # sigma defaults to 1.0 (standard normal)
 yield_shock  = Lognormal("yield", mu=0.03, sigma=0.02)
 correlated   = MultivariateNormal(names=["equity", "bonds"],
                                   mean=[0.07, 0.03], cov=...)
-# jumps      = Jump("rare_event", intensity=0.02,            # planned
-#                   size_dist=Lognormal(mu=-0.1, sigma=0.2))
+intraday     = Uniform("tick", low=-0.01, high=0.01)
+demand       = Categorical("demand", values=[0., 5., 20.],
+                            probabilities=[0.6, 0.3, 0.1])
+jumps        = Jump("rare_event", intensity=0.05,
+                    jump_mu=-0.1, jump_sigma=0.2)
 ```
 
-Quadrature: Gauss-Hermite for `Normal`/`Lognormal`, Cholesky-rotated tensor-product Gauss-Hermite for `MultivariateNormal`. `Jump` will use mixed quadrature when it lands. The solver supports at most one shock object per problem (a `MultivariateNormal` counts as one even though it carries K named dimensions).
+Quadrature: Gauss-Hermite for `Normal` / `Lognormal`, Cholesky-rotated tensor-product Gauss-Hermite for `MultivariateNormal`, Gauss-Legendre for `Uniform`, exact (one node per category) for `Categorical`, Bernoulli-jump approximation with Gauss-Hermite over the log-magnitude for `Jump`. Multiple independent shocks per problem are supported via tensor-product quadrature — `N_q` grows multiplicatively, so two or three shocks per problem is the comfortable range.
 
 Shock names are optional — nameless shocks work as `size_dist` for `Jump` or any inner-distribution slot where they're not surfaced through `shock[...]`. Defaults: `Normal()` is standard normal; `Lognormal()` is standard lognormal, with `mu` and `sigma` as parameters of the underlying normal (`log(X) ~ N(mu, sigma)`). `MultivariateNormal` has no no-args default — pass `names=[...]` (or `dim=N`) to fix the dimensionality, and `names[i]` indexes both `mean[i]` and row/column `i` of `cov`.
 
