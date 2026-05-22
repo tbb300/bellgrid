@@ -244,6 +244,11 @@ def setup_solve(
     index_flat = [m.reshape(-1) for m in index_mesh]
 
     def _resolve_bound(b):
+        """Return either a scalar or a tensor of shape ``[1]*K + [1]``
+        with size ``n_c`` at the referenced state's axis and 1 elsewhere
+        (plus a trailing 1 for the action axis). ``lo + (hi - lo) * norm``
+        then broadcasts correctly through ``_to_state_shape``.
+        """
         if isinstance(b, str):
             if b not in state_name_set:
                 raise ValueError(
@@ -255,24 +260,26 @@ def setup_solve(
                     "state-dependent action bounds may only reference a "
                     f"ContinuousState (got {type(state_order[pos]).__name__})"
                 )
-            if K_cont != 1:
-                raise NotImplementedError(
-                    "state-dependent action bounds require exactly one "
-                    "ContinuousState (currently)"
-                )
-            return state_axes[0].unsqueeze(-1)
+            # K state axes + 1 trailing action axis. Size n_c at the
+            # referenced state's position, 1 everywhere else.
+            view_shape = [1] * (K + 1)
+            view_shape[pos] = state_dims[pos]
+            return state_axes[pos].view(view_shape)
         return torch.as_tensor(float(b), dtype=dtype, device=device)
 
     def _to_state_shape(val: torch.Tensor) -> torch.Tensor:
-        if val.ndim == 1:
-            view_shape = (1,) * K + (N_a,)
-            return val.view(view_shape).expand(state_dims_tup + (N_a,)).contiguous()
-        if val.ndim == 2 and K_cont == 1 and val.shape == (state_dims[0], N_a):
-            view_shape = (state_dims[0],) + (1,) * (K - 1) + (N_a,)
-            return val.view(view_shape).expand(state_dims_tup + (N_a,)).contiguous()
-        raise NotImplementedError(
-            f"action tensor with shape {tuple(val.shape)} not supported for K={K}"
-        )
+        """Broadcast an action value tensor to the joint state-action shape.
+
+        Accepts scalars, 1-D values of shape ``(N_a,)`` (static bound), or
+        any tensor already broadcastable to ``state_dims_tup + (N_a,)``
+        (state-dependent bounds, which arrive shaped via ``_resolve_bound``).
+        """
+        target = state_dims_tup + (N_a,)
+        if val.ndim == 0:
+            val = val.view((1,) * (K + 1))
+        elif val.ndim == 1 and val.shape[0] == N_a:
+            val = val.view((1,) * K + (N_a,))
+        return val.broadcast_to(target).contiguous()
 
     action_tensors: dict = {}
     action_kinds: dict = {}
@@ -465,6 +472,41 @@ def _bellman_partial(
     # next-state-aware reward.
     next_state_dict = ctx.problem.transition(state_b, action_b, shock_b, t)
 
+    # Validate the return dict's keys up-front so the user sees one
+    # aggregated error rather than a per-axis "missing key" deep in the
+    # multilinear-query loop below. Cheap; ``next_state_dict`` is already
+    # in hand.
+    if not isinstance(next_state_dict, dict):
+        raise ValueError(
+            f"problem.transition() must return a dict; got "
+            f"{type(next_state_dict).__name__}"
+        )
+    _expected = {
+        name for name, kind in zip(ctx.state_names, ctx.state_kinds)
+        if kind != "markov"
+    }
+    _forbidden = {
+        name for name, kind in zip(ctx.state_names, ctx.state_kinds)
+        if kind == "markov"
+    }
+    _got = set(next_state_dict.keys())
+    _missing = _expected - _got
+    if _missing:
+        raise ValueError(
+            f"problem.transition() return dict missing keys for non-markov "
+            f"states: {sorted(_missing)}. Expected entries for every "
+            f"ContinuousState and DiscreteState (MarkovChain states are "
+            f"advanced internally and must NOT be returned)."
+        )
+    _forbidden_present = _forbidden & _got
+    if _forbidden_present:
+        raise ValueError(
+            f"problem.transition() return dict contains entries for "
+            f"MarkovChain states {sorted(_forbidden_present)}. These are "
+            f"advanced internally by the solver via their transition "
+            f"matrix — drop them from the return dict."
+        )
+
     if ctx.reward_takes_next_state:
         r = ctx.problem.reward(state_b, action_b, shock_b, t, next_state_dict)
     else:
@@ -483,10 +525,6 @@ def _bellman_partial(
         ctx.state_names, ctx.state_kinds, ctx.transforms
     ):
         if kind == "continuous":
-            if name not in next_state_dict:
-                raise ValueError(
-                    f"transition return dict missing state key {name!r}"
-                )
             nv = torch.as_tensor(
                 next_state_dict[name], dtype=ctx.dtype, device=ctx.device
             )
@@ -499,10 +537,6 @@ def _bellman_partial(
                 u_next = u_next.expand(lookup_shape).contiguous()
             queries.append(u_next)
         elif kind == "discrete":
-            if name not in next_state_dict:
-                raise ValueError(
-                    f"transition return dict missing state key {name!r}"
-                )
             nv = torch.as_tensor(
                 next_state_dict[name], dtype=torch.long, device=ctx.device
             )
@@ -513,11 +547,6 @@ def _bellman_partial(
                 nv = nv.expand(lookup_shape).contiguous()
             queries.append(nv)
         else:  # markov — solver-controlled
-            if name in next_state_dict:
-                raise ValueError(
-                    f"transition must not return MarkovChain state {name!r} "
-                    "(advanced via its transition matrix)"
-                )
             n_mk = ctx.n_ms[mc_idx]
             arange = torch.arange(n_mk, dtype=torch.long, device=ctx.device)
             # This chain's kept axis is at position len(chunk_shape) + mc_idx

@@ -259,7 +259,7 @@ def test_markov_chain_must_not_appear_in_transition_dict():
         horizon=range(0, 2),
         discount=0.95,
     )
-    with pytest.raises(ValueError, match="must not return MarkovChain"):
+    with pytest.raises(ValueError, match="entries for MarkovChain states"):
         solve(
             problem,
             state_grid={"wealth": RegularGrid(n=8)},
