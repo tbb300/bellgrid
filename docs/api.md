@@ -26,6 +26,10 @@ phase    = DiscreteState("phase", n=2, labels=["accumulation", "decumulation"])
 
 `MarkovChain` is a discrete state with built-in transition dynamics — declare the matrix once and the solver handles the expectation over next states. The convention is row-stochastic: `matrix[i, j] = Pr(next = j | current = i)`, so rows sum to 1. The number of categories is inferred from `matrix.shape[0]`; if `labels` is provided it must have matching length. For state-dependent or otherwise non-stationary discrete dynamics, use `DiscreteState` and write the transition yourself in `transition`. The library doesn't ship a built-in categorical innovation shock; the canonical workaround for stochastic plain-`DiscreteState` transitions is to threshold a `Normal` innovation inside `transition`.
 
+Multiple `MarkovChain`s per problem are supported. Each chain's matrix contraction adds a kept axis to the V lookup and contributes one matrix-multiply at the end of the Bellman update; the cost is additive in the number of chains, not multiplicative.
+
+Inside the Bellman update, the user's `transition` and `reward` callables only see the **current** values of any `MarkovChain` state — the next value is integrated internally via the matrix and isn't exposed. For dynamics that depend on the next markov value (e.g. a bond return that's a function of yield drift between regimes), model the state as a `ContinuousState` AR-style process or as a `DiscreteState` with hand-rolled stochastic dynamics.
+
 #### Mixed discrete + continuous states
 
 The value function is stored as a tensor with one axis per state dimension. Continuous axes use `state_grid` points; discrete axes (`DiscreteState`, `MarkovChain`) use one point per category. Interpolation runs over the continuous axes only — at each discrete slice the value function is a smooth function over continuous coordinates, and queries inside `policy(state)` / `value(state)` interpolate within the slice corresponding to the discrete state's current value.

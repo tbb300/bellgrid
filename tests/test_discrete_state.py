@@ -476,6 +476,192 @@ def test_simulate_with_markov_chain_stationary_proportions():
     assert abs(p0 - 4.0 / 7.0) < 0.05
 
 
+# --- multiple MarkovChains -----------------------------------------------
+
+
+def test_two_independent_markov_chains():
+    """Two independent MarkovChains: V should respect both chain transitions
+    and equal the analytic V for a 1-period problem with V_T=1 on a target cell."""
+    # Two independent 2-state chains with different transition matrices.
+    P1 = np.array([[0.9, 0.1], [0.2, 0.8]])
+    P2 = np.array([[0.6, 0.4], [0.3, 0.7]])
+
+    def transition(state, _a, _sh, _t):
+        return {"x": state["x"]}
+
+    def reward(_s, _a, _sh, _t):
+        return torch.tensor(0.0, dtype=torch.float64)
+
+    def terminal(state):
+        # 1 on the joint cell (regime1=0, regime2=0), 0 elsewhere
+        r1 = state["regime1"]
+        r2 = state["regime2"]
+        return ((r1 == 0) & (r2 == 0)).to(torch.float64)
+
+    problem = Problem(
+        states=[
+            ContinuousState("x", range=(0.0, 1.0)),
+            MarkovChain("regime1", matrix=P1),
+            MarkovChain("regime2", matrix=P2),
+        ],
+        actions=[DiscreteAction("noop", n=1)],
+        transition=transition, reward=reward,
+        shocks=[],
+        horizon=range(0, 1),       # one backward step
+        discount=1.0,
+        terminal_reward=terminal,
+    )
+    _, value = solve(
+        problem,
+        state_grid={"x": RegularGrid(n=8)},
+        action_grid={},
+        solver=BackwardInduction(n_quad=1),
+    )
+
+    # E[1{r1'=0, r2'=0} | r1=i, r2=j] = P1[i, 0] * P2[j, 0] under independence.
+    for i in (0, 1):
+        for j in (0, 1):
+            v = value({
+                "x": torch.tensor([0.5], dtype=torch.float64),
+                "regime1": torch.tensor([i], dtype=torch.long),
+                "regime2": torch.tensor([j], dtype=torch.long),
+            }, t=0).item()
+            expected = P1[i, 0] * P2[j, 0]
+            assert v == pytest.approx(expected, abs=1e-12), (
+                f"V at (regime1={i}, regime2={j}) = {v}, expected {expected}"
+            )
+
+
+def test_multiple_markov_chains_match_product_chain():
+    """Two MarkovChains modelled separately should give the same V as a
+    single MarkovChain over the product space with the Kronecker matrix."""
+    P1 = np.array([[0.8, 0.2], [0.3, 0.7]])
+    P2 = np.array([[0.5, 0.5], [0.4, 0.6]])
+    # Kronecker product gives the joint matrix for the product chain
+    P_joint = np.kron(P1, P2)  # 4x4
+
+    def reward(_s, _a, _sh, _t):
+        return torch.tensor(0.0, dtype=torch.float64)
+
+    def transition_two(state, _a, _sh, _t):
+        return {"x": state["x"]}
+
+    # Terminal reward: a "smooth-ish" function of regime indices that
+    # tests the integration is correct across multiple t values.
+    def terminal_two(state):
+        r1 = state["regime1"].to(torch.float64)
+        r2 = state["regime2"].to(torch.float64)
+        return r1 * 10.0 + r2
+
+    problem_two = Problem(
+        states=[
+            ContinuousState("x", range=(0.0, 1.0)),
+            MarkovChain("regime1", matrix=P1),
+            MarkovChain("regime2", matrix=P2),
+        ],
+        actions=[DiscreteAction("noop", n=1)],
+        transition=transition_two, reward=reward,
+        shocks=[], horizon=range(0, 3), discount=0.95,
+        terminal_reward=terminal_two,
+    )
+
+    def transition_one(state, _a, _sh, _t):
+        return {"x": state["x"]}
+
+    # For the product chain: joint = 2*r1 + r2 (encoded as a single 4-state index)
+    def terminal_one(state):
+        r = state["joint"].to(torch.float64)
+        r1 = (r // 2).to(torch.float64)
+        r2 = (r % 2).to(torch.float64)
+        return r1 * 10.0 + r2
+
+    problem_one = Problem(
+        states=[
+            ContinuousState("x", range=(0.0, 1.0)),
+            MarkovChain("joint", matrix=P_joint),
+        ],
+        actions=[DiscreteAction("noop", n=1)],
+        transition=transition_one, reward=reward,
+        shocks=[], horizon=range(0, 3), discount=0.95,
+        terminal_reward=terminal_one,
+    )
+
+    _, value_two = solve(
+        problem_two,
+        state_grid={"x": RegularGrid(n=8)},
+        action_grid={},
+        solver=BackwardInduction(n_quad=1),
+    )
+    _, value_one = solve(
+        problem_one,
+        state_grid={"x": RegularGrid(n=8)},
+        action_grid={},
+        solver=BackwardInduction(n_quad=1),
+    )
+
+    # Compare V at each joint state
+    for i in (0, 1):
+        for j in (0, 1):
+            v_two = value_two({
+                "x": torch.tensor([0.5], dtype=torch.float64),
+                "regime1": torch.tensor([i], dtype=torch.long),
+                "regime2": torch.tensor([j], dtype=torch.long),
+            }, t=0).item()
+            v_one = value_one({
+                "x": torch.tensor([0.5], dtype=torch.float64),
+                "joint": torch.tensor([2 * i + j], dtype=torch.long),
+            }, t=0).item()
+            assert v_two == pytest.approx(v_one, abs=1e-10), (
+                f"two-MC V at ({i},{j}) = {v_two}, product-MC V = {v_one}"
+            )
+
+
+def test_simulate_with_two_markov_chains():
+    """simulate works with two MarkovChains and samples each independently."""
+    P1 = np.array([[0.9, 0.1], [0.2, 0.8]])
+    P2 = np.array([[0.7, 0.3], [0.5, 0.5]])
+
+    def transition(state, _a, _sh, _t):
+        return {"x": state["x"]}
+
+    def reward(_s, _a, _sh, _t):
+        return torch.tensor(0.0, dtype=torch.float64)
+
+    problem = Problem(
+        states=[
+            ContinuousState("x", range=(0.0, 1.0)),
+            MarkovChain("regime1", matrix=P1),
+            MarkovChain("regime2", matrix=P2),
+        ],
+        actions=[DiscreteAction("noop", n=1)],
+        transition=transition, reward=reward, shocks=[],
+        horizon=range(0, 20), discount=0.95,
+    )
+    policy, _ = solve(
+        problem,
+        state_grid={"x": RegularGrid(n=8)},
+        action_grid={},
+        solver=BackwardInduction(n_quad=1),
+    )
+
+    paths = simulate(
+        policy=policy, problem=problem, n=500,
+        initial_state={"x": 0.5, "regime1": 0, "regime2": 0},
+        seed=0,
+    )
+    assert paths["regime1"].dtype == torch.long
+    assert paths["regime2"].dtype == torch.long
+    # Both chains start at 0
+    assert (paths["regime1"][:, 0] == 0).all()
+    assert (paths["regime2"][:, 0] == 0).all()
+    # After 20 steps the two chains have moved independently — check that
+    # each has both categories represented.
+    final1 = paths["regime1"][:, -1].cpu().numpy()
+    final2 = paths["regime2"][:, -1].cpu().numpy()
+    assert set(final1.tolist()) == {0, 1}
+    assert set(final2.tolist()) == {0, 1}
+
+
 def test_state_declaration_order_is_irrelevant():
     """User can list states in any order — solver reorders to canonical
     internally. The resulting V at the same state should match."""

@@ -96,10 +96,8 @@ def simulate(
             f"simulate supports only {[c.__name__ for c in _SUPPORTED_SHOCKS]} shocks"
         )
     mc_states = [s for s in problem.states if isinstance(s, MarkovChain)]
-    if len(mc_states) > 1:
-        raise NotImplementedError(
-            "simulate supports at most one MarkovChain per problem"
-        )
+    # Multiple MarkovChains are supported — each samples independently
+    # from its own row of P given the current category.
     if problem.horizon is None:
         raise NotImplementedError("simulate does not support infinite horizon yet")
     if callable(problem.discount):

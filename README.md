@@ -76,7 +76,7 @@ Each notebook opens with the problem statement and equations, then runs bellgrid
 
 ## What's built
 
-- **States**: `ContinuousState` (with optional `asinh` / `log` warp), `DiscreteState`, `MarkovChain`.
+- **States**: `ContinuousState` (with optional `asinh` / `log` warp), `DiscreteState`, `MarkovChain` (any number per problem; cost is additive in chains).
 - **Actions**: `ContinuousAction` (with optional state-dependent bounds), `DiscreteAction`.
 - **Shocks**: `Normal`, `Lognormal`, `MultivariateNormal` (Gauss-Hermite); `Uniform` on `[low, high]` (Gauss-Legendre); `Categorical` with finite support (exact); `Jump` (Bernoulli-approximated Poisson with Normal log-magnitudes). Multiple independent shocks per problem are supported via tensor-product quadrature.
 - **Grids**: `RegularGrid`, `WarpedGrid`.

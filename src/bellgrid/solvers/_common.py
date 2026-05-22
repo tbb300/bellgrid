@@ -92,8 +92,14 @@ class SolveContext:
     shock_dict_b: dict
     weights_b: torch.Tensor
 
-    n_m: int                               # markov-chain category count (0 if none)
-    matrix_b: torch.Tensor | None
+    # Markov-chain integration data. One entry per chain in canonical
+    # ordering (continuous → discrete → markov, so markov chains are at
+    # the end of state_dims). Each ``matrix_b`` is broadcastable to the
+    # lookup tensor with size n_mk at the chain's current-state axis and
+    # size n_mk at the last kept axis (we contract chains in reverse,
+    # always summing the trailing axis).
+    n_ms: list                             # [n_m1, n_m2, ...] empty if no chains
+    matrices_b: list                       # [matrix_b1, matrix_b2, ...]
 
     dtype: torch.dtype
     device: Any
@@ -144,10 +150,6 @@ def setup_solve(
         )
 
     mc_states_user = [s for s in problem.states if isinstance(s, MarkovChain)]
-    if len(mc_states_user) > 1:
-        raise NotImplementedError(
-            "tracer supports at most one MarkovChain per problem"
-        )
 
     # Callable discount (``discount(state, t)`` returning a scalar tensor or
     # something broadcastable to the state mesh) is supported; scalar
@@ -359,20 +361,26 @@ def setup_solve(
     }
     weights_b = shock_weights.view(shock_view)
 
-    if K_mc == 1:
-        mc = mc_states[0]
-        n_m = mc.n
-        lookup_shape = full_shape + (n_m,)
+    # For each markov chain, build a matrix tensor broadcastable to the
+    # lookup tensor AT THE TIME WE CONTRACT IT. We contract chains in
+    # REVERSE order (chain K_mc - 1 first, chain 0 last), summing the
+    # trailing axis each step. When chain k is contracted, chains
+    # k+1, ..., K_mc-1 have already been summed out, so V_at_next has
+    # dim count ``len(full_shape) + (k + 1)``. matrix_b for chain k
+    # therefore has that dim count, with size n_mk at the chain's
+    # current-state axis (K_cont + K_disc + k) and at the last axis
+    # (the kept axis being summed).
+    n_ms: list = [mc.n for mc in mc_states]
+    matrices_b: list = []
+    lookup_shape = full_shape + tuple(n_ms)
+    for k, mc in enumerate(mc_states):
         matrix_t = torch.as_tensor(mc.matrix, dtype=dtype, device=device)
-        m_axis_pos = K_cont + K_disc
-        view_shape = [1] * (len(full_shape) + 1)
-        view_shape[m_axis_pos] = n_m
-        view_shape[-1] = n_m
-        matrix_b = matrix_t.view(view_shape)
-    else:
-        lookup_shape = full_shape
-        matrix_b = None
-        n_m = 0
+        m_axis_pos = K_cont + K_disc + k
+        n_dims_at_contraction = len(full_shape) + (k + 1)
+        view_shape = [1] * n_dims_at_contraction
+        view_shape[m_axis_pos] = mc.n
+        view_shape[-1] = mc.n
+        matrices_b.append(matrix_t.view(view_shape))
 
     state_ranges = {
         s.name: tuple(s.range)
@@ -402,11 +410,11 @@ def setup_solve(
         action_b=action_b,
         shock_dict_b=shock_dict_b,
         weights_b=weights_b,
-        n_m=n_m,
         chunk_size=chunk_size,
         state_ranges=state_ranges,
         reward_takes_next_state=reward_takes_next_state,
-        matrix_b=matrix_b,
+        n_ms=n_ms,
+        matrices_b=matrices_b,
         dtype=dtype,
         device=device,
     )
@@ -465,12 +473,12 @@ def _bellman_partial(
         chunk_shape
     ).contiguous()
 
-    if ctx.K_mc == 1:
-        lookup_shape = chunk_shape + (ctx.n_m,)
-    else:
-        lookup_shape = chunk_shape
+    # Build the lookup tensor shape. With K_mc markov chains, the lookup
+    # has one extra "kept" axis per chain, appended in chain order.
+    lookup_shape = chunk_shape + tuple(ctx.n_ms)
 
     queries = []
+    mc_idx = 0  # which markov chain (in canonical order) we're on
     for name, kind, transform in zip(
         ctx.state_names, ctx.state_kinds, ctx.transforms
     ):
@@ -484,8 +492,11 @@ def _bellman_partial(
             )
             nv = nv.broadcast_to(chunk_shape).contiguous()
             u_next = transform(nv)
-            if ctx.K_mc == 1:
-                u_next = u_next.unsqueeze(-1).expand(lookup_shape).contiguous()
+            if ctx.K_mc >= 1:
+                # Extend by K_mc trailing 1-dims, then expand to lookup_shape.
+                for _ in range(ctx.K_mc):
+                    u_next = u_next.unsqueeze(-1)
+                u_next = u_next.expand(lookup_shape).contiguous()
             queries.append(u_next)
         elif kind == "discrete":
             if name not in next_state_dict:
@@ -496,8 +507,10 @@ def _bellman_partial(
                 next_state_dict[name], dtype=torch.long, device=ctx.device
             )
             nv = nv.broadcast_to(chunk_shape).contiguous()
-            if ctx.K_mc == 1:
-                nv = nv.unsqueeze(-1).expand(lookup_shape).contiguous()
+            if ctx.K_mc >= 1:
+                for _ in range(ctx.K_mc):
+                    nv = nv.unsqueeze(-1)
+                nv = nv.expand(lookup_shape).contiguous()
             queries.append(nv)
         else:  # markov — solver-controlled
             if name in next_state_dict:
@@ -505,19 +518,27 @@ def _bellman_partial(
                     f"transition must not return MarkovChain state {name!r} "
                     "(advanced via its transition matrix)"
                 )
-            arange = torch.arange(ctx.n_m, dtype=torch.long, device=ctx.device)
-            view_arange = [1] * len(chunk_shape) + [ctx.n_m]
+            n_mk = ctx.n_ms[mc_idx]
+            arange = torch.arange(n_mk, dtype=torch.long, device=ctx.device)
+            # This chain's kept axis is at position len(chunk_shape) + mc_idx
+            # in the lookup shape; all other axes are size 1 for this query.
+            view_arange = [1] * len(lookup_shape)
+            view_arange[len(chunk_shape) + mc_idx] = n_mk
             arange_b = arange.view(view_arange).expand(lookup_shape).contiguous()
             queries.append(arange_b)
+            mc_idx += 1
 
     V_lookup = multilinear(ctx.axes_for_lookup, V_next, queries)
 
-    if ctx.K_mc == 1:
-        # matrix_b has size-1 in the shock dim, so it broadcasts cleanly
-        # across the chunked shock slice — no re-shape needed.
-        V_at_next = (V_lookup * ctx.matrix_b).sum(dim=-1)
-    else:
-        V_at_next = V_lookup
+    # Contract markov-chain kept axes in REVERSE order so the trailing
+    # axis is always the next one to sum. Each contraction reduces dim
+    # count by 1; after K_mc contractions, shape is back to chunk_shape.
+    # matrix_b for each chain is size-1 in the shock dim (and every dim
+    # except the chain's current-axis and kept-axis), so it broadcasts
+    # cleanly across the chunked shock slice.
+    V_at_next = V_lookup
+    for matrix_b in reversed(ctx.matrices_b):
+        V_at_next = (V_at_next * matrix_b).sum(dim=-1)
 
     integrand = r + discount_chunk * V_at_next
     return (integrand * weights_b).sum(dim=-1)
