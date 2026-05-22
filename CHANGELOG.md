@@ -4,6 +4,86 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/) — the leading `0.`
 indicates the API may still change in non-additive ways before a `1.0` release.
 
+## [0.1.0a2] — 2026-05-22
+
+Substantial alpha-2: two new shocks, two solver-side capabilities, three
+API loosenings, and a memory-management feature. All non-breaking.
+
+### Added
+- **`Categorical` shock** — finite-support discrete iid shock. Quadrature
+  is exact (K nodes = values, K weights = probabilities; `n_quad` is
+  ignored).
+- **`Uniform` shock** — continuous uniform on `[low, high]` with
+  Gauss-Legendre quadrature.
+- **Callable discount** — `discount(state, t)` may now return a scalar
+  or any tensor broadcastable to the state mesh. Use for mortality,
+  equipment-failure hazards, or any other state/age-dependent
+  termination factor.
+- **Next-state-aware reward** — `reward` may declare a 5th positional
+  argument and receive the dict of next-state values returned by
+  `transition`. Detected via `inspect.signature` (4-arg form
+  unchanged). Combined with callable discount, the two cleanly
+  express mortality + bequest as
+  `V_t = u(c) + β·E[p_survive·V_{t+1} + (1-p_survive)·Bequest(s')]`.
+- **Multiple `MarkovChain`s per problem** — previously capped at one;
+  now any number. Cost is additive in chains (one extra matrix-
+  contraction per chain) rather than multiplicative (which is what
+  baking them into a single product chain would have cost).
+- **Memory-chunked Bellman update** — the `chunk_size` parameter on
+  `solve()` was previously accepted-but-ignored; it now caps the
+  per-Bellman-step memory by splitting the shock axis into chunks.
+  Verified by a regression test that `chunk_size=1` and
+  `chunk_size=2**30` produce the same V on a Merton problem.
+- **Boundary-escape diagnostic** — after each solve, a single
+  `problem.transition` call with the optimal policy is used to
+  measure the weighted fraction of next-states that fall outside
+  each `ContinuousState`'s range. Emits a `UserWarning` per state
+  whose interior-mean escape exceeds 10%. Cheap (<5% overhead on the
+  smallest solves, near-zero on big ones). Opt-out via
+  `BackwardInduction(boundary_check=False)` / `PolicyIteration(...)`.
+- **`simulate()` parity with the solver** — now accepts callable
+  discount, infinite-horizon `Problem`s (via a new `n_periods`
+  parameter), and 5-arg next-state-aware reward.
+- **State-dependent action bounds with K_cont > 1** — previously
+  restricted to exactly one `ContinuousState`; now references any
+  declared continuous state regardless of how many there are.
+
+### Changed
+- **Multilinear interpolation now supports mixed continuous and discrete
+  axes** in a single call. Detected per-query by `dtype`: floating →
+  continuous (interpolated), integer → discrete (exact gather).
+  Discrete axes don't contribute corners, so cost is `2 ** K_cont`
+  corner gathers rather than `2 ** K_total`.
+- **Transition return-dict validation** moved upfront and aggregated:
+  one `ValueError` listing all missing / forbidden keys instead of
+  per-axis errors raised mid-loop.
+- **Style sweep**: `Optional[T]` → `T | None` and `Union[A, B]` → `A | B`
+  across the source; dropped now-unused `typing` imports. Pure cleanup.
+- **Docstring pass**: filled in docstrings for `ContinuousState`,
+  `ContinuousAction`, and `Problem` (the three primitives that were
+  bare while their siblings had rich docstrings).
+
+### Fixed
+- `torch.searchsorted` non-contiguous warning was firing on every
+  Bellman step with a markov chain. The expanded/strided query is
+  now materialised at the call site, silencing the warning at no
+  additional cost (the kernel was doing the copy internally anyway).
+
+### Known limitations (unchanged from 0.1.0a1)
+- At most one `MarkovChain` per problem → **lifted in 0.1.0a2**.
+- The user's `transition` and `reward` only see the **current**
+  value of any `MarkovChain` state; the next value is integrated
+  internally via the matrix and isn't exposed. For dynamics that
+  depend on the next markov value (e.g. a bond return tied to yield
+  drift between regimes), model the state as a `ContinuousState`
+  AR-process or as a `DiscreteState` with hand-rolled stochastic
+  dynamics.
+- Single-axis (shock-only) chunking. For problems where state ×
+  action dominates memory, chunk_size on the shock axis alone may
+  not be enough — a future release will extend chunking to action
+  and/or state axes.
+- No implicit differentiation through the solver. Still planned.
+
 ## [0.1.0a1] — 2026-05-22
 
 PyPI-rendered README fix: relative links to `examples/` and `docs/` in the
@@ -84,5 +164,6 @@ collecting feedback.
 - No infinite-horizon `MarkovChain` initial-state defaulting to the stationary
   distribution in `simulate()` (users pass an explicit category index for now).
 
+[0.1.0a2]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a2
 [0.1.0a1]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a1
 [0.1.0a0]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a0
