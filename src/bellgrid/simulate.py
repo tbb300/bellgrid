@@ -14,7 +14,7 @@ from row ``P[current[i], :]`` via ``torch.multinomial``. The user's
 rule as the solver).
 """
 
-from typing import Callable, Optional
+from typing import Callable
 
 import torch
 
@@ -44,7 +44,7 @@ def simulate(
     problem: Problem,
     n: int,
     initial_state: dict,
-    seed: Optional[int] = None,
+    seed: int | None = None,
     dtype: torch.dtype = torch.float64,
     device: str | torch.device | None = None,
 ) -> dict:

@@ -25,9 +25,18 @@ class BackwardInduction:
     ----------
     n_quad : int
         Number of Gauss-Hermite quadrature nodes per shock dimension.
+    boundary_check : bool
+        After the solve, run one extra ``problem.transition`` call with
+        the optimal policy and warn if a non-trivial fraction of next-
+        states fall outside any ``ContinuousState``'s range. Cheap
+        (under ~5% overhead in the worst case, near-zero on big solves)
+        and has caught real boundary bugs in development. Disable only
+        for tight inner loops (e.g., gradient-based calibration that
+        re-solves repeatedly).
     """
 
     n_quad: int = 7
+    boundary_check: bool = True
 
 
 def _backward_induction(
@@ -66,7 +75,7 @@ def _backward_induction(
 
     # Boundary diagnostic on the final (earliest-t) optimal policy. The
     # boundary issue is usually consistent across t so one check is enough.
-    if last_policy:
+    if solver.boundary_check and last_policy:
         check_boundary_escape(ctx, last_policy, last_t)
 
     return (

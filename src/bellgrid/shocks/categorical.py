@@ -19,7 +19,6 @@ pass ``values=(0., 1., 2., ...)`` and cast inside ``transition`` /
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -103,7 +102,7 @@ class Categorical:
         self,
         n: int,
         *,
-        generator: Optional[torch.Generator] = None,
+        generator: torch.Generator | None = None,
         dtype: torch.dtype = torch.float64,
         device: str | torch.device = "cpu",
     ) -> torch.Tensor:

@@ -17,7 +17,6 @@ matched to the value function's curvature gives a tighter approximation
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 
@@ -51,7 +50,7 @@ class WarpedGrid:
     """
 
     n: int
-    warp: Optional[str] = None
+    warp: str | None = None
 
     def __post_init__(self):
         if self.n < 2:
@@ -64,7 +63,7 @@ class WarpedGrid:
         *,
         dtype: torch.dtype = torch.float64,
         device: str | torch.device = "cpu",
-        warp: Optional[str] = None,
+        warp: str | None = None,
     ) -> torch.Tensor:
         if not (high > low):
             raise ValueError(
@@ -85,7 +84,7 @@ class WarpedGrid:
         self,
         x: torch.Tensor,
         *,
-        warp: Optional[str] = None,
+        warp: str | None = None,
     ) -> torch.Tensor:
         """Map physical-space values to the warped coordinate the solver
         interpolates in. Identity-equivalent under no warp; under ``log`` we
@@ -98,7 +97,7 @@ class WarpedGrid:
             x = torch.clamp(x, min=torch.finfo(x.dtype).tiny)
         return tensor_fwd(x)
 
-    def _effective_warp(self, warp: Optional[str]) -> str:
+    def _effective_warp(self, warp: str | None) -> str:
         effective = self.warp if self.warp is not None else warp
         if effective is None:
             raise ValueError(

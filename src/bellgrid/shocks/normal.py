@@ -2,8 +2,6 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional
-
 import numpy as np
 import torch
 
@@ -18,7 +16,7 @@ class Normal:
     (e.g., `Jump.size_dist`) without being surfaced through `shock[...]`.
     """
 
-    name: Optional[str] = None
+    name: str | None = None
     sigma: float = 1.0
 
     def __post_init__(self):
@@ -60,7 +58,7 @@ class Normal:
         self,
         n: int,
         *,
-        generator: Optional[torch.Generator] = None,
+        generator: torch.Generator | None = None,
         dtype: torch.dtype = torch.float64,
         device: str | torch.device = "cpu",
     ) -> torch.Tensor:

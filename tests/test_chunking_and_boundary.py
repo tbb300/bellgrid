@@ -123,6 +123,42 @@ def test_boundary_warning_fires_when_optimal_policy_overshoots():
     )
 
 
+def test_boundary_check_can_be_opted_out():
+    """boundary_check=False suppresses the diagnostic entirely, even on a
+    problem that would otherwise trigger it."""
+
+    def transition(state, _a, _sh, _t):
+        return {"x": state["x"] * 5.0}
+
+    def reward(_s, action, _sh, _t):
+        return action["c"]
+
+    problem = Problem(
+        states=[ContinuousState("x", range=(0.0, 1.0))],
+        actions=[ContinuousAction("c", bounds=(0.0, 1.0))],
+        transition=transition,
+        reward=reward,
+        shocks=[],
+        horizon=range(0, 3),
+        discount=0.9,
+    )
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always", UserWarning)
+        solve(
+            problem,
+            state_grid={"x": RegularGrid(n=16)},
+            action_grid={"c": RegularGrid(n=8)},
+            solver=BackwardInduction(n_quad=1, boundary_check=False),
+        )
+    boundary_warnings = [
+        str(w.message) for w in captured
+        if issubclass(w.category, UserWarning) and "outside its grid range" in str(w.message)
+    ]
+    assert boundary_warnings == [], (
+        f"expected no warnings with boundary_check=False; got: {boundary_warnings}"
+    )
+
+
 def test_boundary_warning_does_not_fire_on_well_configured_merton():
     """The widely-configured Merton (range up to 200) is fine in practice —
     the diagnostic should NOT fire on it."""

@@ -7,7 +7,6 @@ matching the convention documented in ``docs/api.md``.
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -17,7 +16,7 @@ import torch
 class Lognormal:
     """Univariate lognormal innovation."""
 
-    name: Optional[str] = None
+    name: str | None = None
     mu: float = 0.0
     sigma: float = 1.0
 
@@ -55,7 +54,7 @@ class Lognormal:
         self,
         n: int,
         *,
-        generator: Optional[torch.Generator] = None,
+        generator: torch.Generator | None = None,
         dtype: torch.dtype = torch.float64,
         device: str | torch.device = "cpu",
     ) -> torch.Tensor:

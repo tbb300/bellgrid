@@ -20,7 +20,6 @@ component — the canonical Merton 1976 jump-diffusion model.
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -100,7 +99,7 @@ class Jump:
         self,
         n: int,
         *,
-        generator: Optional[torch.Generator] = None,
+        generator: torch.Generator | None = None,
         dtype: torch.dtype = torch.float64,
         device: str | torch.device = "cpu",
     ) -> dict:

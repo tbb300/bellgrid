@@ -14,7 +14,6 @@ dict-vs-tensor at the call site.
 
 import math
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -122,7 +121,7 @@ class MultivariateNormal:
         self,
         n: int,
         *,
-        generator: Optional[torch.Generator] = None,
+        generator: torch.Generator | None = None,
         dtype: torch.dtype = torch.float64,
         device: str | torch.device = "cpu",
     ) -> dict:

@@ -11,7 +11,7 @@ via the ``SolveContext`` dataclass that bundles up the broadcast arrays.
 import math
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 import torch
 
@@ -92,7 +92,7 @@ class SolveContext:
     weights_b: torch.Tensor
 
     n_m: int                               # markov-chain category count (0 if none)
-    matrix_b: Optional[torch.Tensor]
+    matrix_b: torch.Tensor | None
 
     dtype: torch.dtype
     device: Any

@@ -13,7 +13,6 @@ functions in finance / consumption-savings are smooth enough that
 """
 
 from dataclasses import dataclass
-from typing import Optional
 
 import numpy as np
 import torch
@@ -74,7 +73,7 @@ class Uniform:
         self,
         n: int,
         *,
-        generator: Optional[torch.Generator] = None,
+        generator: torch.Generator | None = None,
         dtype: torch.dtype = torch.float64,
         device: str | torch.device = "cpu",
     ) -> torch.Tensor:

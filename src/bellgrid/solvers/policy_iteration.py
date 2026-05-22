@@ -42,11 +42,17 @@ class PolicyIteration:
         Safety cap on the number of Bellman iterations. Exceeding this
         is a hard error (better to fail loudly than silently return a
         non-converged answer).
+    boundary_check : bool
+        After convergence, run one extra ``problem.transition`` call with
+        the stationary optimal policy and warn if a non-trivial fraction
+        of next-states fall outside any ``ContinuousState``'s range. See
+        ``BackwardInduction.boundary_check`` — same trade-off.
     """
 
     n_quad: int = 7
     tol: float = 1e-6
     max_iters: int = 10_000
+    boundary_check: bool = True
 
 
 def _policy_iteration(
@@ -87,7 +93,8 @@ def _policy_iteration(
         )
 
     # Boundary diagnostic on the converged stationary policy.
-    check_boundary_escape(ctx, policy_now, t=None)
+    if solver.boundary_check:
+        check_boundary_escape(ctx, policy_now, t=None)
 
     # Store under key None so policy(state, t=None) and value(state, t=None)
     # work uniformly with the finite-horizon API.
