@@ -133,6 +133,19 @@ def reward(state, action, shock, t):
 
 `shock` and `t` are always passed; rewards that ignore either can use `_shock` / `_t`. This is intentionally a plain callable, not a class hierarchy. CRRA utility, quadratic cost, option payoff, inventory holding-cost — all the same primitive. If you are minimizing cost, negate.
 
+#### Next-state-aware reward
+
+If `reward` declares a 5th positional argument, the solver passes the dict of next-state values returned by `transition`. Useful for payoffs that fire on the **next** state — bequests at death, exit fees, terminal-style payouts during life. bellgrid detects the signature via `inspect.signature` and dispatches accordingly; existing 4-arg rewards work unchanged.
+
+```python
+def reward(state, action, shock, t, next_state):
+    consumption = action["consume"]
+    # Per-period bequest paid with probability (1 - p_survive(t)):
+    return torch.log(consumption) + beta * (1.0 - p_survive[t]) * bequest_u(next_state["wealth"])
+```
+
+`next_state` contains the entries the user's `transition` returned — continuous values as floats, discrete-state values as longs. `MarkovChain` states do not appear (they're advanced by the solver internally, after `reward` is evaluated).
+
 For finite-horizon problems, an optional terminal reward `(state) -> scalar` evaluated at the end of the horizon (e.g., bequest motive, residual value):
 
 ```python
@@ -148,14 +161,24 @@ For option-style problems where exercise is a per-period action choice, the exer
 discount = 0.96
 ```
 
-A scalar is the common case. For problems with state- or age-dependent termination (mortality being one example), `discount` may also be a callable `(state, t) -> scalar`:
+A scalar is the common case. For problems with state- or age-dependent termination (mortality, equipment-failure hazards, bankruptcy probabilities), `discount` may also be a callable `(state, t) -> scalar | tensor` returning either a scalar or anything broadcastable to the state mesh:
 
 ```python
 def discount(state, t):
     return 0.96 * survival_probability(state, t)
 ```
 
-This is the general mechanism for stochastic termination. Mortality tables, equipment-failure hazards, and bankruptcy probabilities all fit through this slot — none are built-in.
+Note that callable-discount shrinks the continuation `E[V_{t+1}]` by the per-period factor — it does **not** by itself express stochastic termination with a payoff at the moment of death. For a mortality-style mixture `V_t = u(c) + β·E[p_survive·V_{t+1} + (1-p_survive)·Bequest(s')]`, combine callable discount (for the continuation side) with a [next-state-aware `reward`](#next-state-aware-reward) (for the bequest side). Together:
+
+```python
+def discount(state, t):
+    return beta * p_survive[t]   # the continuation shrinks by p_survive
+
+def reward(state, action, shock, t, next_state):
+    return u(action["consume"]) + beta * (1.0 - p_survive[t]) * bequest_u(next_state["wealth"])
+```
+
+The β appears in both — the user-side cost of an otherwise-clean factoring.
 
 ### Problem
 

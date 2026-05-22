@@ -8,6 +8,7 @@ markov matrix contraction — is identical, lives here, and is shared
 via the ``SolveContext`` dataclass that bundles up the broadcast arrays.
 """
 
+import inspect
 import math
 import warnings
 from dataclasses import dataclass, field
@@ -105,6 +106,11 @@ class SolveContext:
     # Continuous-state range cache, used by the boundary diagnostic.
     state_ranges: dict = field(default_factory=dict)
 
+    # True if the user's ``reward`` accepts a 5th positional argument
+    # ``next_state`` — for next-state-dependent payoffs like a per-period
+    # bequest. Detected from ``inspect.signature`` at setup time.
+    reward_takes_next_state: bool = False
+
 
 def setup_solve(
     problem: Problem,
@@ -143,8 +149,10 @@ def setup_solve(
             "tracer supports at most one MarkovChain per problem"
         )
 
-    if callable(problem.discount):
-        raise NotImplementedError("callable discount not implemented in tracer")
+    # Callable discount (``discount(state, t)`` returning a scalar tensor or
+    # something broadcastable to the state mesh) is supported; scalar
+    # discount is the common case. We don't need to do anything special at
+    # setup time — ``bellman_step`` checks ``callable()`` per call.
 
     # ---- canonical ordering: continuous → discrete → markov ------------
     cont_states = [s for s in problem.states if isinstance(s, ContinuousState)]
@@ -310,7 +318,29 @@ def setup_solve(
         shock_weights = torch.ones(1, dtype=dtype, device=device)
         N_q = 1
 
-    discount = float(problem.discount)
+    # Pass through; bellman_step handles both scalar and callable discount.
+    discount = problem.discount if callable(problem.discount) else float(problem.discount)
+
+    # Detect whether reward takes a 5th positional argument (next_state).
+    # We accept either ``reward(state, action, shock, t)`` (the historical
+    # signature) or ``reward(state, action, shock, t, next_state)``.
+    _sig = inspect.signature(problem.reward)
+    _positional = [
+        p for p in _sig.parameters.values()
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
+    ]
+    if len(_positional) == 4:
+        reward_takes_next_state = False
+    elif len(_positional) == 5:
+        reward_takes_next_state = True
+    else:
+        raise ValueError(
+            f"reward must take 4 or 5 positional arguments "
+            f"(state, action, shock, t [, next_state]); got {len(_positional)}"
+        )
 
     # ---- broadcast arrays for the Bellman update -----------------------
     full_shape = state_dims_tup + (N_a, N_q)
@@ -375,6 +405,7 @@ def setup_solve(
         n_m=n_m,
         chunk_size=chunk_size,
         state_ranges=state_ranges,
+        reward_takes_next_state=reward_takes_next_state,
         matrix_b=matrix_b,
         dtype=dtype,
         device=device,
@@ -397,13 +428,15 @@ def _bellman_partial(
     t,
     q_start: int,
     q_end: int,
+    discount,
 ) -> torch.Tensor:
     """Contribution of shock nodes ``[q_start, q_end)`` to ``Σ_q (r + γ V) · w``.
 
     Returns a ``state_dims + (N_a,)``-shaped tensor: the partial Bellman
     integrand summed over the slice of shock nodes. Callers concatenate
     the partials by summing across all shock-slice calls, then take the
-    max over the action axis.
+    max over the action axis. ``discount`` is either a scalar or a tensor
+    broadcastable to ``full_shape`` (precomputed once per Bellman step).
     """
     n_q = q_end - q_start
     chunk_shape = ctx.state_dims_tup + (ctx.N_a, n_q)
@@ -415,13 +448,22 @@ def _bellman_partial(
     action_b = {name: x[..., q_start:q_end] for name, x in ctx.action_b.items()}
     shock_b = {name: x[..., q_start:q_end] for name, x in ctx.shock_dict_b.items()}
     weights_b = ctx.weights_b[..., q_start:q_end]
+    if isinstance(discount, torch.Tensor):
+        discount_chunk = discount[..., q_start:q_end]
+    else:
+        discount_chunk = discount
 
-    r = ctx.problem.reward(state_b, action_b, shock_b, t)
+    # Always evaluate the transition first — its output may be needed by a
+    # next-state-aware reward.
+    next_state_dict = ctx.problem.transition(state_b, action_b, shock_b, t)
+
+    if ctx.reward_takes_next_state:
+        r = ctx.problem.reward(state_b, action_b, shock_b, t, next_state_dict)
+    else:
+        r = ctx.problem.reward(state_b, action_b, shock_b, t)
     r = torch.as_tensor(r, dtype=ctx.dtype, device=ctx.device).broadcast_to(
         chunk_shape
     ).contiguous()
-
-    next_state_dict = ctx.problem.transition(state_b, action_b, shock_b, t)
 
     if ctx.K_mc == 1:
         lookup_shape = chunk_shape + (ctx.n_m,)
@@ -477,7 +519,7 @@ def _bellman_partial(
     else:
         V_at_next = V_lookup
 
-    integrand = r + ctx.discount * V_at_next
+    integrand = r + discount_chunk * V_at_next
     return (integrand * weights_b).sum(dim=-1)
 
 
@@ -493,6 +535,18 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
     spans the entire shock axis and the loop is a single iteration; for
     larger problems we accumulate the Bellman expectation across chunks.
     """
+    # Pre-compute the discount once per Bellman step — same across all
+    # shock-slice chunks. Scalar discounts stay scalar; callable discounts
+    # are materialised to ``full_shape`` so chunked slicing works
+    # uniformly.
+    if callable(ctx.discount):
+        disc_raw = ctx.discount(ctx.state_b_dict, t)
+        discount = torch.as_tensor(
+            disc_raw, dtype=ctx.dtype, device=ctx.device
+        ).broadcast_to(ctx.full_shape).contiguous()
+    else:
+        discount = ctx.discount
+
     state_count = (
         math.prod(ctx.state_dims_tup) if ctx.state_dims_tup else 1
     )
@@ -500,7 +554,7 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
     chunk_n_q = max(1, ctx.chunk_size // max(elements_per_shock, 1))
 
     if chunk_n_q >= ctx.N_q:
-        bellman = _bellman_partial(ctx, V_next, t, 0, ctx.N_q)
+        bellman = _bellman_partial(ctx, V_next, t, 0, ctx.N_q, discount)
     else:
         bellman = torch.zeros(
             ctx.state_dims_tup + (ctx.N_a,),
@@ -508,7 +562,9 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
         )
         for q_start in range(0, ctx.N_q, chunk_n_q):
             q_end = min(q_start + chunk_n_q, ctx.N_q)
-            bellman = bellman + _bellman_partial(ctx, V_next, t, q_start, q_end)
+            bellman = bellman + _bellman_partial(
+                ctx, V_next, t, q_start, q_end, discount,
+            )
 
     V_now, argmax = bellman.max(dim=-1)
     policy_now = {
