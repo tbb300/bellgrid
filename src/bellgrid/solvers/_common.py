@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 import torch
 
+from ..grids.golden import GoldenSearch
 from ..grids.regular import RegularGrid
 from ..grids.warped import WarpedGrid
 from ..interpolation.multilinear import multilinear
@@ -116,6 +117,41 @@ class SolveContext:
     # ``next_state`` — for next-state-dependent payoffs like a per-period
     # bequest. Detected from ``inspect.signature`` at setup time.
     reward_takes_next_state: bool = False
+
+    # Per-continuous-action search strategy: "grid" (enumerate
+    # ``action_tensors`` and ``max``) or "golden" (use ``action_tensors``
+    # as a coarse seed, then refine via vectorized golden-section).
+    # Populated by ``setup_solve`` from the user's ``action_grid`` dict.
+    # Empty if no continuous actions.
+    action_search: dict = field(default_factory=dict)
+
+    # Per-continuous-action GoldenSearch spec (n_iter, n_coord). Absent
+    # for actions on the grid path. Keeps the per-action refinement
+    # parameters close to the rest of the action metadata.
+    golden_specs: dict = field(default_factory=dict)
+
+    # Resolved action bounds per continuous action, used by golden-search
+    # to build per-state brackets. Each entry is a (lo, hi) pair of
+    # tensors broadcastable to ``state_dims + (1,)`` (or 0-d scalar
+    # tensors for fixed bounds).
+    action_bounds: dict = field(default_factory=dict)
+
+    # Raw 1-D shock-node tensors, length ``N_q`` each (after tensor-product
+    # combination). Used by the golden-search path to rebuild Bellman
+    # broadcasts at arbitrary action values, since ``shock_dict_b`` is
+    # already expanded to ``full_shape``.
+    shock_values: dict = field(default_factory=dict)
+
+    # Joint-axis layout for the golden-search path. Discrete and grid-
+    # continuous actions stay enumerated through refinement; golden-
+    # continuous actions get their grid axes collapsed and refined.
+    # ``enum_sizes`` lists the per-action sizes along the joint enumeration
+    # axis in the action declaration order (== ``action_sizes`` from
+    # setup); ``enum_strides[i]`` is the row-major stride of action i in
+    # the joint axis. Populated regardless of whether any action is
+    # golden so callers can decompose ``argmax`` deterministically.
+    enum_sizes: list = field(default_factory=list)
+    enum_strides: list = field(default_factory=list)
 
 
 def setup_solve(
@@ -292,17 +328,29 @@ def setup_solve(
 
     action_tensors: dict = {}
     action_kinds: dict = {}
+    action_search: dict = {}
+    golden_specs: dict = {}
+    action_bounds: dict = {}
     for a, idx in zip(problem.actions, index_flat):
         if isinstance(a, ContinuousAction):
-            norm_grid = action_grid[a.name].points(
-                0.0, 1.0, dtype=dtype, device=device
-            )
+            grid_spec = action_grid[a.name]
+            norm_grid = grid_spec.points(0.0, 1.0, dtype=dtype, device=device)
             norm = norm_grid[idx]
             lo = _resolve_bound(a.bounds[0])
             hi = _resolve_bound(a.bounds[1])
             val = lo + (hi - lo) * norm
             action_tensors[a.name] = _to_state_shape(val)
             action_kinds[a.name] = "continuous"
+            # Stash bounds and search strategy for the golden-search path.
+            # Even grid-path continuous actions get bounds saved — the
+            # golden path holds them constant via ``action_tensors`` but a
+            # uniform layout simplifies the code.
+            action_bounds[a.name] = (lo, hi)
+            if isinstance(grid_spec, GoldenSearch):
+                action_search[a.name] = "golden"
+                golden_specs[a.name] = grid_spec
+            else:
+                action_search[a.name] = "grid"
         else:
             action_tensors[a.name] = _to_state_shape(idx)
             action_kinds[a.name] = "discrete"
@@ -404,6 +452,15 @@ def setup_solve(
         if isinstance(s, ContinuousState)
     }
 
+    # Joint-action axis strides — row-major over ``action_sizes``. The
+    # joint axis flat index decomposes as
+    # ``sum_i (action_index_i * enum_strides[i])``. Used by golden-search
+    # to recover per-action seed indices from a single ``argmax`` over the
+    # joint axis (cheap; one ``%``/``//`` per action).
+    enum_strides: list = [1] * len(action_sizes)
+    for i in range(len(action_sizes) - 2, -1, -1):
+        enum_strides[i] = enum_strides[i + 1] * action_sizes[i + 1]
+
     return SolveContext(
         problem=problem,
         discount=discount,
@@ -433,6 +490,12 @@ def setup_solve(
         matrices_b=matrices_b,
         dtype=dtype,
         device=device,
+        action_search=action_search,
+        golden_specs=golden_specs,
+        action_bounds=action_bounds,
+        shock_values=shock_values,
+        enum_sizes=list(action_sizes),
+        enum_strides=enum_strides,
     )
 
 
@@ -446,68 +509,14 @@ def terminal_value(ctx: SolveContext) -> torch.Tensor:
     ).contiguous()
 
 
-def _bellman_partial(
-    ctx: SolveContext,
-    V_next: torch.Tensor,
-    t,
-    q_start: int,
-    q_end: int,
-    a_start: int,
-    a_end: int,
-    discount,
-) -> torch.Tensor:
-    """Contribution of shock nodes ``[q_start, q_end)`` and action chunk
-    ``[a_start, a_end)`` to ``Σ_q (r + γ V) · w``.
+def _validate_transition_keys(ctx: SolveContext, next_state_dict) -> None:
+    """One-shot validation of the user's ``transition`` return dict.
 
-    Returns a ``state_dims + (a_end - a_start,)``-shaped tensor: the
-    partial Bellman integrand summed over the shock-node slice for this
-    action subset. The caller composes across shock-slice calls (sum)
-    and across action-chunk calls (running max + argmax). ``discount``
-    is either a scalar or a tensor broadcastable to ``full_shape``
-    (precomputed once per Bellman step).
+    Hoisted out of the integrand so the golden-search path can validate
+    once per Bellman step rather than once per refinement eval. Cheap
+    either way (set comparisons on small dicts), but the savings add up
+    over ``n_iter × n_coord × N_golden`` calls.
     """
-    n_q = q_end - q_start
-    n_a_chunk = a_end - a_start
-    chunk_shape = ctx.state_dims_tup + (n_a_chunk, n_q)
-
-    # Slice the expanded views along the action and shock axes. Each
-    # slice stays a view (no allocation) since slicing along an existing
-    # axis is just an offset + size change.
-    # Fast path: when the action axis is full (the common case — only
-    # OOM-class problems chunk the action axis), avoid the redundant
-    # ``[..., 0:N_a, ...]`` slice on every broadcast tensor. Each slice
-    # is "free" in memory but allocates a new view object; over the
-    # course of a finite-horizon solve with shock chunking that adds
-    # up to hundreds of milliseconds.
-    if a_start == 0 and a_end == ctx.N_a:
-        state_b = {name: x[..., q_start:q_end] for name, x in ctx.state_b_dict.items()}
-        action_b = {name: x[..., q_start:q_end] for name, x in ctx.action_b.items()}
-        shock_b = {name: x[..., q_start:q_end] for name, x in ctx.shock_dict_b.items()}
-    else:
-        state_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.state_b_dict.items()}
-        action_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.action_b.items()}
-        shock_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.shock_dict_b.items()}
-    # weights_b is held as a broadcast view (size 1 on the action axis,
-    # not expanded). Always slice only the shock axis: slicing the
-    # action axis on a size-1 view with ``a_start > 0`` would produce
-    # size 0, and the view broadcasts cleanly downstream anyway.
-    weights_b = ctx.weights_b[..., q_start:q_end]
-    if isinstance(discount, torch.Tensor) and discount.ndim == len(ctx.full_shape):
-        # Full-shape discount tensor — slice along both chunked axes.
-        discount_chunk = discount[..., a_start:a_end, q_start:q_end]
-    else:
-        # Scalar tensor, smaller-shape tensor, or plain Python scalar —
-        # broadcasts naturally in ``r + discount_chunk * V_at_next`` below.
-        discount_chunk = discount
-
-    # Always evaluate the transition first — its output may be needed by a
-    # next-state-aware reward.
-    next_state_dict = ctx.problem.transition(state_b, action_b, shock_b, t)
-
-    # Validate the return dict's keys up-front so the user sees one
-    # aggregated error rather than a per-axis "missing key" deep in the
-    # multilinear-query loop below. Cheap; ``next_state_dict`` is already
-    # in hand.
     if not isinstance(next_state_dict, dict):
         raise ValueError(
             f"problem.transition() must return a dict; got "
@@ -538,6 +547,39 @@ def _bellman_partial(
             f"advanced internally by the solver via their transition "
             f"matrix — drop them from the return dict."
         )
+
+
+def _bellman_core(
+    ctx: SolveContext,
+    V_next: torch.Tensor,
+    t,
+    state_b: dict,
+    action_b: dict,
+    shock_b: dict,
+    weights_b: torch.Tensor,
+    discount_chunk,
+    chunk_shape: tuple,
+    *,
+    validate: bool = True,
+) -> torch.Tensor:
+    """The Bellman integrand: ``Σ_q (r + γ V_next ∘ f) · w`` at the
+    pre-broadcast tensors the caller supplies.
+
+    Both callers — chunked grid enumeration (via ``_bellman_partial``) and
+    golden-search refinement (via ``_bellman_at_action_values``) — share
+    this body. The only difference is how they shape ``action_b``:
+    grid enumeration slices the prebuilt ``ctx.action_b``; golden search
+    broadcasts a per-state action-value tensor.
+
+    Returns a ``state_dims + (M,)`` tensor where ``M`` is the size of the
+    action axis in ``chunk_shape`` (i.e. ``chunk_shape[-2]``). The shock
+    axis (``chunk_shape[-1]``) is summed out by ``weights_b``.
+    """
+    # Always evaluate the transition first — its output may be needed by a
+    # next-state-aware reward.
+    next_state_dict = ctx.problem.transition(state_b, action_b, shock_b, t)
+    if validate:
+        _validate_transition_keys(ctx, next_state_dict)
 
     if ctx.reward_takes_next_state:
         r = ctx.problem.reward(state_b, action_b, shock_b, t, next_state_dict)
@@ -606,6 +648,365 @@ def _bellman_partial(
     return (integrand * weights_b).sum(dim=-1)
 
 
+def _bellman_partial(
+    ctx: SolveContext,
+    V_next: torch.Tensor,
+    t,
+    q_start: int,
+    q_end: int,
+    a_start: int,
+    a_end: int,
+    discount,
+) -> torch.Tensor:
+    """Contribution of shock nodes ``[q_start, q_end)`` and action chunk
+    ``[a_start, a_end)`` to ``Σ_q (r + γ V) · w``.
+
+    Returns a ``state_dims + (a_end - a_start,)``-shaped tensor: the
+    partial Bellman integrand summed over the shock-node slice for this
+    action subset. The caller composes across shock-slice calls (sum)
+    and across action-chunk calls (running max + argmax). ``discount``
+    is either a scalar or a tensor broadcastable to ``full_shape``
+    (precomputed once per Bellman step).
+
+    Thin wrapper around ``_bellman_core`` that slices the pre-built
+    enumeration tensors held on ``ctx``.
+    """
+    n_q = q_end - q_start
+    n_a_chunk = a_end - a_start
+    chunk_shape = ctx.state_dims_tup + (n_a_chunk, n_q)
+
+    # Slice the expanded views along the action and shock axes. Each
+    # slice stays a view (no allocation) since slicing along an existing
+    # axis is just an offset + size change.
+    # Fast path: when the action axis is full (the common case — only
+    # OOM-class problems chunk the action axis), avoid the redundant
+    # ``[..., 0:N_a, ...]`` slice on every broadcast tensor. Each slice
+    # is "free" in memory but allocates a new view object; over the
+    # course of a finite-horizon solve with shock chunking that adds
+    # up to hundreds of milliseconds.
+    if a_start == 0 and a_end == ctx.N_a:
+        state_b = {name: x[..., q_start:q_end] for name, x in ctx.state_b_dict.items()}
+        action_b = {name: x[..., q_start:q_end] for name, x in ctx.action_b.items()}
+        shock_b = {name: x[..., q_start:q_end] for name, x in ctx.shock_dict_b.items()}
+    else:
+        state_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.state_b_dict.items()}
+        action_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.action_b.items()}
+        shock_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.shock_dict_b.items()}
+    # weights_b is held as a broadcast view (size 1 on the action axis,
+    # not expanded). Always slice only the shock axis: slicing the
+    # action axis on a size-1 view with ``a_start > 0`` would produce
+    # size 0, and the view broadcasts cleanly downstream anyway.
+    weights_b = ctx.weights_b[..., q_start:q_end]
+    if isinstance(discount, torch.Tensor) and discount.ndim == len(ctx.full_shape):
+        # Full-shape discount tensor — slice along both chunked axes.
+        discount_chunk = discount[..., a_start:a_end, q_start:q_end]
+    else:
+        # Scalar tensor, smaller-shape tensor, or plain Python scalar —
+        # broadcasts naturally in ``r + discount_chunk * V_at_next`` below.
+        discount_chunk = discount
+
+    return _bellman_core(
+        ctx, V_next, t,
+        state_b=state_b, action_b=action_b, shock_b=shock_b,
+        weights_b=weights_b, discount_chunk=discount_chunk,
+        chunk_shape=chunk_shape,
+    )
+
+
+def _bellman_at_action_values(
+    ctx: SolveContext,
+    V_next: torch.Tensor,
+    t,
+    action_values: dict,
+    discount,
+    *,
+    validate: bool = False,
+) -> torch.Tensor:
+    """Bellman value at user-supplied per-state action values.
+
+    Parameters
+    ----------
+    action_values : dict
+        One entry per declared action. Each value is a tensor of shape
+        ``state_dims + (M,)``: ``M`` candidate joint-action configurations
+        per state. The semantics of "joint configuration" are up to the
+        caller — typically ``M = N_disc`` (one continuous value per
+        discrete combo) for the golden-search refinement loop.
+
+    Returns
+    -------
+    Tensor of shape ``state_dims + (M,)``: the Bellman value at each
+    candidate. The caller takes ``.max(dim=-1)`` to fold over the M
+    candidates (e.g. to pick the optimal discrete combo after continuous
+    refinement).
+    """
+    # M is the trailing-axis size of any action-value tensor. They all
+    # share it by construction; we read it from an arbitrary one.
+    sample = next(iter(action_values.values()))
+    M = sample.shape[-1]
+    chunk_shape = ctx.state_dims_tup + (M, ctx.N_q)
+
+    state_b = {
+        name: m.reshape(ctx.state_dims_tup + (1, 1)).expand(chunk_shape)
+        for name, m in ctx.state_meshes_dict.items()
+    }
+    action_b = {
+        name: val.unsqueeze(-1).expand(chunk_shape)
+        for name, val in action_values.items()
+    }
+    shock_view = (1,) * ctx.K + (1, ctx.N_q)
+    shock_b = {
+        name: nodes.view(shock_view).expand(chunk_shape)
+        for name, nodes in ctx.shock_values.items()
+    }
+    weights_b = ctx.weights_b  # already shaped (1,)*K + (1, N_q)
+
+    return _bellman_core(
+        ctx, V_next, t,
+        state_b=state_b, action_b=action_b, shock_b=shock_b,
+        weights_b=weights_b, discount_chunk=discount,
+        chunk_shape=chunk_shape,
+        validate=validate,
+    )
+
+
+# Golden ratio conjugate: 1 / φ = (√5 − 1) / 2 ≈ 0.618. Each iteration of
+# the standard golden-section search contracts the bracket by this factor.
+_GOLDEN_PHI_INV = (math.sqrt(5.0) - 1.0) / 2.0
+
+
+def _golden_section_axis(
+    ctx: SolveContext,
+    V_next: torch.Tensor,
+    t,
+    discount,
+    action_values: dict,
+    axis_name: str,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    n_iter: int,
+) -> torch.Tensor:
+    """One axis of vectorized golden-section search.
+
+    Maximise the Bellman value over ``action_values[axis_name]`` while
+    holding every other action fixed at its current value. ``a`` and
+    ``b`` are the (per-cell) bracket bounds — same shape as
+    ``action_values[axis_name]``.
+
+    Uses the standard one-fresh-eval-per-iter trick: after contracting,
+    one of the two new interior points coincides with the previous
+    interior point on the other side (a consequence of φ² = 1 − φ⁻¹),
+    so we can reuse its Bellman value and only evaluate the genuinely
+    new point. We pick the per-cell fresh point with ``torch.where`` and
+    do a single batched eval — so the GPU work is one Bellman call per
+    iter regardless of the mask pattern.
+    """
+    h = b - a
+    c = a + (1.0 - _GOLDEN_PHI_INV) * h
+    d = a + _GOLDEN_PHI_INV * h
+
+    def eval_at(val: torch.Tensor) -> torch.Tensor:
+        av = dict(action_values)
+        av[axis_name] = val
+        return _bellman_at_action_values(
+            ctx, V_next, t, av, discount, validate=False,
+        )
+
+    fc = eval_at(c)
+    fd = eval_at(d)
+
+    for _ in range(n_iter):
+        keep_left = fc > fd                              # max is in [a, d]
+        b = torch.where(keep_left, d, b)
+        a = torch.where(keep_left, a, c)
+        h = b - a
+        c_new = a + (1.0 - _GOLDEN_PHI_INV) * h
+        d_new = a + _GOLDEN_PHI_INV * h
+        # In keep_left cells the genuinely new point is c_new; in the
+        # other cells it's d_new. The OTHER new interior point coincides
+        # with the previous interior point on the opposite side, so its
+        # Bellman value carries over without re-evaluation.
+        fresh = torch.where(keep_left, c_new, d_new)
+        f_fresh = eval_at(fresh)
+        fc_new = torch.where(keep_left, f_fresh, fd)
+        fd_new = torch.where(keep_left, fc, f_fresh)
+        c, d = c_new, d_new
+        fc, fd = fc_new, fd_new
+
+    # Pick whichever of the two final interior points has the higher
+    # Bellman value (bracket midpoint would be slightly biased).
+    use_c = fc > fd
+    return torch.where(use_c, c, d)
+
+
+def _refine_with_golden_section(
+    ctx: SolveContext,
+    V_next: torch.Tensor,
+    t,
+    bellman: torch.Tensor,
+    discount,
+) -> tuple[torch.Tensor, dict]:
+    """Coordinate-descent golden-section refinement on top of a seed grid.
+
+    ``bellman`` is the result of the grid Bellman: shape
+    ``state_dims + (N_a,)``, with action indices in declaration order
+    after a row-major flatten of the per-action sizes.
+
+    We split the actions into:
+      - **enumerated** axes — discrete actions and any continuous actions
+        whose grid spec is *not* ``GoldenSearch``. These stay enumerated
+        through refinement so the discrete choice can re-pick after the
+        continuous values move.
+      - **refined** axes — continuous actions with ``GoldenSearch``. Their
+        seed grid indices are extracted per ``(state, enum_combo)``;
+        their values are then coordinate-descended via
+        ``_golden_section_axis``.
+
+    Returns the final ``(V_now, policy_now)`` post-refinement.
+    """
+    action_names = [a.name for a in ctx.problem.actions]
+    K = len(ctx.state_dims_tup)
+
+    enum_positions: list = []
+    refined_positions: list = []
+    for i, name in enumerate(action_names):
+        if ctx.action_search.get(name) == "golden":
+            refined_positions.append(i)
+        else:
+            enum_positions.append(i)
+
+    enum_sizes = [ctx.enum_sizes[i] for i in enum_positions]
+    refined_sizes = [ctx.enum_sizes[i] for i in refined_positions]
+    refined_names = [action_names[i] for i in refined_positions]
+    N_enum = 1
+    for s in enum_sizes:
+        N_enum *= s
+
+    # Reshape (state_dims + (N_a,)) → (state_dims + per_action_sizes).
+    per_action_shape = ctx.state_dims_tup + tuple(ctx.enum_sizes)
+    bellman_pa = bellman.view(per_action_shape)
+
+    # Permute so enum axes come before refined axes (state_dims fixed).
+    perm = (
+        list(range(K))
+        + [K + i for i in enum_positions]
+        + [K + i for i in refined_positions]
+    )
+    bellman_perm = bellman_pa.permute(perm).contiguous()
+
+    # Collapse enum axes into one, refined axes into one.
+    n_refined = len(refined_sizes)
+    refined_flat_size = 1
+    for s in refined_sizes:
+        refined_flat_size *= s
+    bellman_collapsed = bellman_perm.reshape(
+        ctx.state_dims_tup + (N_enum, refined_flat_size)
+    )
+
+    # Per-(state, enum_combo) best seed in the refined sub-grid.
+    _, refined_flat_argmax = bellman_collapsed.max(dim=-1)  # state_dims + (N_enum,)
+
+    # Decompose refined-flat argmax into per-refined-axis indices.
+    refined_strides_local = [1] * n_refined
+    for i in range(n_refined - 2, -1, -1):
+        refined_strides_local[i] = refined_strides_local[i + 1] * refined_sizes[i + 1]
+    seed_idx_per_refined: dict = {}
+    rem = refined_flat_argmax
+    for j, name in enumerate(refined_names):
+        s = refined_strides_local[j]
+        seed_idx_per_refined[name] = rem // s
+        rem = rem % s
+
+    # Per-(state, enum_combo) enum-axis indices, decomposed from the
+    # arange over [0, N_enum). enum_strides_local is the stride in the
+    # *collapsed* enum axis; ctx.enum_strides[i] is the stride of the
+    # i-th action in the *original* N_a layout — both needed below.
+    enum_strides_local = [1] * len(enum_sizes)
+    for i in range(len(enum_sizes) - 2, -1, -1):
+        enum_strides_local[i] = enum_strides_local[i + 1] * enum_sizes[i + 1]
+
+    enum_combo_idx = torch.arange(N_enum, dtype=torch.long, device=ctx.device)
+    enum_combo_b = enum_combo_idx.view((1,) * K + (N_enum,)).expand(
+        ctx.state_dims_tup + (N_enum,)
+    )
+
+    per_axis_idx: list = [None] * len(action_names)
+    rem = enum_combo_b
+    for j, pos in enumerate(enum_positions):
+        s = enum_strides_local[j]
+        per_axis_idx[pos] = rem // s
+        rem = rem % s
+    for pos in refined_positions:
+        per_axis_idx[pos] = seed_idx_per_refined[action_names[pos]]
+
+    # Compose back into the original N_a flat index for gather.
+    joint_flat = torch.zeros(
+        ctx.state_dims_tup + (N_enum,), dtype=torch.long, device=ctx.device,
+    )
+    for i, idx_tensor in enumerate(per_axis_idx):
+        if ctx.enum_strides[i] != 0:
+            joint_flat = joint_flat + idx_tensor * ctx.enum_strides[i]
+
+    # Gather per-action seed values at joint_flat.
+    action_values: dict = {}
+    target_a_shape = ctx.state_dims_tup + (ctx.N_a,)
+    for name, at in ctx.action_tensors.items():
+        at_full = at.broadcast_to(target_a_shape)
+        action_values[name] = torch.gather(at_full, -1, joint_flat)
+
+    # Coordinate-descent refinement. n_coord is the max across all golden
+    # specs so every axis gets enough rounds; the per-axis n_iter still
+    # controls how tightly each axis contracts.
+    n_coord = max(ctx.golden_specs[name].n_coord for name in refined_names)
+    for _ in range(n_coord):
+        for name in refined_names:
+            spec = ctx.golden_specs[name]
+            lo_t, hi_t = ctx.action_bounds[name]
+            current = action_values[name]
+            lo_b = (
+                lo_t.broadcast_to(current.shape)
+                if isinstance(lo_t, torch.Tensor) and lo_t.ndim > 0
+                else torch.full_like(current, float(lo_t))
+            )
+            hi_b = (
+                hi_t.broadcast_to(current.shape)
+                if isinstance(hi_t, torch.Tensor) and hi_t.ndim > 0
+                else torch.full_like(current, float(hi_t))
+            )
+            # Bracket: one seed-cell width on each side of the current value,
+            # clamped to the action bounds. This bounds the search to the
+            # original seed cell on the first round and to a tight
+            # neighbourhood on subsequent rounds — the global basin is
+            # already pinned down by the seed grid.
+            cell = (hi_b - lo_b) / (spec.n_init - 1)
+            a = torch.maximum(current - cell, lo_b)
+            b = torch.minimum(current + cell, hi_b)
+            # If bracket is degenerate (current at boundary AND cell width
+            # would put both ends at the same value), skip — there's
+            # nothing to refine.
+            action_values[name] = _golden_section_axis(
+                ctx, V_next, t, discount, action_values, name, a, b, spec.n_iter,
+            )
+
+    # Final Bellman per (state, enum_combo), then pick best enum combo.
+    V_per_enum = _bellman_at_action_values(
+        ctx, V_next, t, action_values, discount, validate=False,
+    )
+    V_now, best_enum_idx = V_per_enum.max(dim=-1)
+
+    policy_now: dict = {}
+    gather_idx = best_enum_idx.unsqueeze(-1)
+    for name, av in action_values.items():
+        gathered = torch.gather(av, -1, gather_idx).squeeze(-1)
+        if ctx.action_kinds.get(name) == "discrete":
+            # Discrete action values are stored as floats in action_tensors
+            # via _to_state_shape; restore the long dtype the user expects.
+            gathered = gathered.to(torch.long)
+        policy_now[name] = gathered
+
+    return V_now, policy_now
+
+
 def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tensor, dict]:
     """One Bellman update.
 
@@ -617,6 +1018,14 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
     roughly ``ctx.chunk_size`` elements. For small problems the chunk
     spans the entire shock axis and the loop is a single iteration; for
     larger problems we accumulate the Bellman expectation across chunks.
+
+    When any continuous action uses ``GoldenSearch`` as its action grid
+    spec, the grid Bellman is followed by a coordinate-descent
+    golden-section refinement (see ``_refine_with_golden_section``). The
+    seed grid (``n_init`` points per refined axis) pins the global
+    basin; the refinement then sharpens the continuous values to ~1e-5
+    of the action range in ~20 evals per axis — much tighter than a
+    practical ``RegularGrid``.
     """
     # Pre-compute the discount once per Bellman step — same across all
     # shock-slice chunks. We keep it in whatever natural shape the user
@@ -675,12 +1084,34 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
     full_q = (chunk_n_q >= ctx.N_q)
     full_a = (chunk_n_a >= ctx.N_a)
 
+    has_golden = any(s == "golden" for s in ctx.action_search.values())
+
+    if has_golden and not full_a:
+        # The golden-search refinement needs the full state × N_a Bellman
+        # tensor to extract per-(state, enum_combo) seed indices for the
+        # refined axes. With a GoldenSearch seed grid (small n_init), N_a
+        # is typically small enough that this is comfortable — but it
+        # *would* OOM if combined with a huge non-golden RegularGrid.
+        # That combination is wasteful anyway (you're paying full grid
+        # cost on the non-golden axis and getting no speedup from golden),
+        # so we error rather than silently fall back.
+        raise RuntimeError(
+            "GoldenSearch refinement requires the full state × N_a "
+            "Bellman accumulator to fit in memory, but the current "
+            f"chunk_size={ctx.chunk_size} would action-chunk this "
+            f"problem (state={ctx.state_dims_tup}, N_a={ctx.N_a}). "
+            "Drop other actions' grid sizes (or remove GoldenSearch) "
+            "or raise chunk_size."
+        )
+
     if full_q and full_a:
         # Fast path: no chunking. Single _bellman_partial call, then
         # max over the action axis. Identical to pre-chunking behaviour.
         bellman = _bellman_partial(
             ctx, V_next, t, 0, ctx.N_q, 0, ctx.N_a, discount,
         )
+        if has_golden:
+            return _refine_with_golden_section(ctx, V_next, t, bellman, discount)
         V_now, argmax = bellman.max(dim=-1)
     elif full_a:
         # Shock-only chunking: accumulate the shock expectation into a
@@ -694,6 +1125,8 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
             bellman = bellman + _bellman_partial(
                 ctx, V_next, t, q_start, q_end, 0, ctx.N_a, discount,
             )
+        if has_golden:
+            return _refine_with_golden_section(ctx, V_next, t, bellman, discount)
         V_now, argmax = bellman.max(dim=-1)
     else:
         # Action chunking: we can never materialise the full (state,
