@@ -267,19 +267,28 @@ def setup_solve(
             return state_axes[pos].view(view_shape)
         return torch.as_tensor(float(b), dtype=dtype, device=device)
 
-    def _to_state_shape(val: torch.Tensor) -> torch.Tensor:
-        """Broadcast an action value tensor to the joint state-action shape.
+    # Heuristic: materialise action_tensors to a contiguous joint
+    # state × action tensor when it's small (downstream ops are slightly
+    # faster on contiguous inputs), but keep it as a broadcast view
+    # when the joint size exceeds ~4 GB (which would OOM on a typical
+    # GPU). The view costs nothing at allocation time and downstream
+    # ops (action_b expand, transition arithmetic, policy gather) read
+    # through the strides correctly.
+    _ACTION_MATERIALIZE_BYTES = 4 * (1024 ** 3)
+    _dtype_bytes = torch.tensor([], dtype=dtype).element_size()
+    _action_tensor_bytes = math.prod(state_dims_tup + (N_a,)) * _dtype_bytes
 
-        Accepts scalars, 1-D values of shape ``(N_a,)`` (static bound), or
-        any tensor already broadcastable to ``state_dims_tup + (N_a,)``
-        (state-dependent bounds, which arrive shaped via ``_resolve_bound``).
-        """
+    def _to_state_shape(val: torch.Tensor) -> torch.Tensor:
+        """Broadcast an action value tensor to the joint state-action shape."""
         target = state_dims_tup + (N_a,)
         if val.ndim == 0:
             val = val.view((1,) * (K + 1))
         elif val.ndim == 1 and val.shape[0] == N_a:
             val = val.view((1,) * K + (N_a,))
-        return val.broadcast_to(target).contiguous()
+        bc = val.broadcast_to(target)
+        if _action_tensor_bytes <= _ACTION_MATERIALIZE_BYTES:
+            return bc.contiguous()
+        return bc
 
     action_tensors: dict = {}
     action_kinds: dict = {}
@@ -443,29 +452,49 @@ def _bellman_partial(
     t,
     q_start: int,
     q_end: int,
+    a_start: int,
+    a_end: int,
     discount,
 ) -> torch.Tensor:
-    """Contribution of shock nodes ``[q_start, q_end)`` to ``Σ_q (r + γ V) · w``.
+    """Contribution of shock nodes ``[q_start, q_end)`` and action chunk
+    ``[a_start, a_end)`` to ``Σ_q (r + γ V) · w``.
 
-    Returns a ``state_dims + (N_a,)``-shaped tensor: the partial Bellman
-    integrand summed over the slice of shock nodes. Callers concatenate
-    the partials by summing across all shock-slice calls, then take the
-    max over the action axis. ``discount`` is either a scalar or a tensor
-    broadcastable to ``full_shape`` (precomputed once per Bellman step).
+    Returns a ``state_dims + (a_end - a_start,)``-shaped tensor: the
+    partial Bellman integrand summed over the shock-node slice for this
+    action subset. The caller composes across shock-slice calls (sum)
+    and across action-chunk calls (running max + argmax). ``discount``
+    is either a scalar or a tensor broadcastable to ``full_shape``
+    (precomputed once per Bellman step).
     """
     n_q = q_end - q_start
-    chunk_shape = ctx.state_dims_tup + (ctx.N_a, n_q)
+    n_a_chunk = a_end - a_start
+    chunk_shape = ctx.state_dims_tup + (n_a_chunk, n_q)
 
-    # Slice the expanded views along the shock axis. Each view stays a
-    # view (no allocation) since slicing along an existing axis is just
-    # an offset + size change.
-    state_b = {name: x[..., q_start:q_end] for name, x in ctx.state_b_dict.items()}
-    action_b = {name: x[..., q_start:q_end] for name, x in ctx.action_b.items()}
-    shock_b = {name: x[..., q_start:q_end] for name, x in ctx.shock_dict_b.items()}
+    # Slice the expanded views along the action and shock axes. Each
+    # slice stays a view (no allocation) since slicing along an existing
+    # axis is just an offset + size change.
+    # Fast path: when the action axis is full (the common case — only
+    # OOM-class problems chunk the action axis), avoid the redundant
+    # ``[..., 0:N_a, ...]`` slice on every broadcast tensor. Each slice
+    # is "free" in memory but allocates a new view object; over the
+    # course of a finite-horizon solve with shock chunking that adds
+    # up to hundreds of milliseconds.
+    if a_start == 0 and a_end == ctx.N_a:
+        state_b = {name: x[..., q_start:q_end] for name, x in ctx.state_b_dict.items()}
+        action_b = {name: x[..., q_start:q_end] for name, x in ctx.action_b.items()}
+        shock_b = {name: x[..., q_start:q_end] for name, x in ctx.shock_dict_b.items()}
+    else:
+        state_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.state_b_dict.items()}
+        action_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.action_b.items()}
+        shock_b = {name: x[..., a_start:a_end, q_start:q_end] for name, x in ctx.shock_dict_b.items()}
+    # weights_b is held as a broadcast view (size 1 on the action axis,
+    # not expanded). Always slice only the shock axis: slicing the
+    # action axis on a size-1 view with ``a_start > 0`` would produce
+    # size 0, and the view broadcasts cleanly downstream anyway.
     weights_b = ctx.weights_b[..., q_start:q_end]
     if isinstance(discount, torch.Tensor) and discount.ndim == len(ctx.full_shape):
-        # Full-shape discount tensor — slice along the shock axis for this chunk.
-        discount_chunk = discount[..., q_start:q_end]
+        # Full-shape discount tensor — slice along both chunked axes.
+        discount_chunk = discount[..., a_start:a_end, q_start:q_end]
     else:
         # Scalar tensor, smaller-shape tensor, or plain Python scalar —
         # broadcasts naturally in ``r + discount_chunk * V_at_next`` below.
@@ -604,12 +633,58 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
     state_count = (
         math.prod(ctx.state_dims_tup) if ctx.state_dims_tup else 1
     )
-    elements_per_shock = state_count * ctx.N_a
-    chunk_n_q = max(1, ctx.chunk_size // max(elements_per_shock, 1))
 
-    if chunk_n_q >= ctx.N_q:
-        bellman = _bellman_partial(ctx, V_next, t, 0, ctx.N_q, discount)
+    # Pick chunk sizes for the action and shock axes. Two distinct
+    # questions:
+    #
+    #   (a) Does the state × action accumulator tensor fit in GPU
+    #       memory? This tensor accumulates shock-chunked partial
+    #       Bellman expectations; it has shape state × N_a regardless
+    #       of how we chunk. If it doesn't fit, we MUST action-chunk
+    #       (which avoids ever materialising it — we instead carry a
+    #       running max + argmax of shape ``state_dims``).
+    #
+    #   (b) Does the per-chunk working tensor (state × action_chunk ×
+    #       shock_chunk) fit in ``ctx.chunk_size``? This is a much
+    #       smaller budget, applied to the transient Bellman-step
+    #       tensors. Within whichever chunking mode (a) picked, we
+    #       size shock chunks to honour it.
+    #
+    # The accumulator threshold is ``chunk_size * ACCUMULATOR_MULTIPLIER``;
+    # the multiplier (16×) reflects that the accumulator is a single
+    # tensor with no intermediate-tensor overhead, so it can be much
+    # larger than the per-chunk working budget without OOM. For
+    # ``chunk_size = 2**20`` (1M elements) on fp64 GPUs, the accumulator
+    # may grow to 16M elements = 128 MB — comfortably small.
+    ACCUMULATOR_MULTIPLIER = 16
+    elements_per_shock_full_action = state_count * ctx.N_a
+    accumulator_fits = (
+        elements_per_shock_full_action <= ctx.chunk_size * ACCUMULATOR_MULTIPLIER
+    )
+    if accumulator_fits:
+        # Shock-only chunking. Use as many shock nodes per chunk as
+        # the per-chunk budget allows.
+        chunk_n_q = max(1, ctx.chunk_size // max(elements_per_shock_full_action, 1))
+        chunk_n_a = ctx.N_a
     else:
+        # Action chunking. Take one shock at a time so the per-chunk
+        # tensor is state_count × chunk_n_a × 1.
+        chunk_n_q = 1
+        chunk_n_a = max(1, ctx.chunk_size // max(state_count, 1))
+
+    full_q = (chunk_n_q >= ctx.N_q)
+    full_a = (chunk_n_a >= ctx.N_a)
+
+    if full_q and full_a:
+        # Fast path: no chunking. Single _bellman_partial call, then
+        # max over the action axis. Identical to pre-chunking behaviour.
+        bellman = _bellman_partial(
+            ctx, V_next, t, 0, ctx.N_q, 0, ctx.N_a, discount,
+        )
+        V_now, argmax = bellman.max(dim=-1)
+    elif full_a:
+        # Shock-only chunking: accumulate the shock expectation into a
+        # full (state, action) tensor, then max over action.
         bellman = torch.zeros(
             ctx.state_dims_tup + (ctx.N_a,),
             dtype=ctx.dtype, device=ctx.device,
@@ -617,10 +692,44 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
         for q_start in range(0, ctx.N_q, chunk_n_q):
             q_end = min(q_start + chunk_n_q, ctx.N_q)
             bellman = bellman + _bellman_partial(
-                ctx, V_next, t, q_start, q_end, discount,
+                ctx, V_next, t, q_start, q_end, 0, ctx.N_a, discount,
             )
+        V_now, argmax = bellman.max(dim=-1)
+    else:
+        # Action chunking: we can never materialise the full (state,
+        # action) tensor, so per action chunk we run shock chunking to
+        # accumulate that slice's Bellman expectation, then take the
+        # max within the slice and update a running maximum + argmax.
+        V_now = torch.full(
+            ctx.state_dims_tup, float("-inf"),
+            dtype=ctx.dtype, device=ctx.device,
+        )
+        argmax = torch.zeros(
+            ctx.state_dims_tup, dtype=torch.long, device=ctx.device,
+        )
+        for a_start in range(0, ctx.N_a, chunk_n_a):
+            a_end = min(a_start + chunk_n_a, ctx.N_a)
+            if chunk_n_q >= ctx.N_q:
+                chunk_bellman = _bellman_partial(
+                    ctx, V_next, t, 0, ctx.N_q, a_start, a_end, discount,
+                )
+            else:
+                chunk_bellman = torch.zeros(
+                    ctx.state_dims_tup + (a_end - a_start,),
+                    dtype=ctx.dtype, device=ctx.device,
+                )
+                for q_start in range(0, ctx.N_q, chunk_n_q):
+                    q_end = min(q_start + chunk_n_q, ctx.N_q)
+                    chunk_bellman = chunk_bellman + _bellman_partial(
+                        ctx, V_next, t,
+                        q_start, q_end, a_start, a_end, discount,
+                    )
+            chunk_max, chunk_argmax_rel = chunk_bellman.max(dim=-1)
+            chunk_argmax = chunk_argmax_rel + a_start
+            update = chunk_max > V_now
+            V_now = torch.where(update, chunk_max, V_now)
+            argmax = torch.where(update, chunk_argmax, argmax)
 
-    V_now, argmax = bellman.max(dim=-1)
     policy_now = {
         name: torch.gather(tensor, -1, argmax.unsqueeze(-1)).squeeze(-1)
         for name, tensor in ctx.action_tensors.items()

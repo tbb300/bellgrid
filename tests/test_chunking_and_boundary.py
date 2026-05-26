@@ -85,6 +85,47 @@ def test_chunking_matches_no_chunking_merton():
         assert vu == pytest.approx(vc, abs=1e-10)
 
 
+def test_action_chunking_matches_no_chunking_merton():
+    """Forcing action-axis chunking (chunk_size small enough that the
+    state × action accumulator no longer fits in the per-chunk budget
+    × the 16× accumulator multiplier) must give the same V and policy
+    as the unchunked solve.
+
+    This exercises the third (action-chunking) code path in
+    ``bellman_step``, which uses a running max + argmax across action
+    chunks rather than materialising the full (state, action) tensor.
+    """
+    problem = _merton_problem()
+    state_grid = {"wealth": WarpedGrid(n=64)}
+    action_grid = {"consume": RegularGrid(n=400)}
+    # state_count = 64, N_a = 400. state_count × N_a = 25,600.
+    # With chunk_size = 1024, ACCUMULATOR_MULTIPLIER=16 → threshold
+    # 16,384 < 25,600, so the action-chunking path activates.
+    # chunk_n_a = max(1, 1024 // 64) = 16 → 25 action chunks per period.
+    policy_un, value_un = solve(
+        problem, state_grid=state_grid, action_grid=action_grid,
+        solver=BackwardInduction(n_quad=7), chunk_size=2**30,
+    )
+    policy_ch, value_ch = solve(
+        problem, state_grid=state_grid, action_grid=action_grid,
+        solver=BackwardInduction(n_quad=7), chunk_size=1024,
+    )
+
+    w = torch.tensor([2.0, 10.0, 25.0, 50.0], dtype=torch.float64)
+    v_un = value_un({"wealth": w}, t=10).numpy()
+    v_ch = value_ch({"wealth": w}, t=10).numpy()
+    c_un = policy_un({"wealth": w}, t=10)["consume"].numpy()
+    c_ch = policy_ch({"wealth": w}, t=10)["consume"].numpy()
+    for vu, vc in zip(v_un, v_ch):
+        assert vu == pytest.approx(vc, abs=1e-10), (
+            f"action-chunked V {vc} differs from unchunked V {vu}"
+        )
+    for cu, cc in zip(c_un, c_ch):
+        assert cu == pytest.approx(cc, abs=1e-10), (
+            f"action-chunked consume {cc} differs from unchunked {cu}"
+        )
+
+
 # --- boundary-escape warning --------------------------------------------
 
 
