@@ -770,6 +770,42 @@ def _bellman_at_action_values(
     )
 
 
+def _evaluate_at_policy(
+    ctx: SolveContext,
+    V_next: torch.Tensor,
+    policy: dict,
+    t,
+) -> torch.Tensor:
+    """One Bellman application at a *fixed* policy — no maximisation.
+
+    ``T_σ V (s) = E_w[ r(s, σ(s), w) + γ V(f(s, σ(s), w)) ]``
+
+    Used by ``PolicyIteration``'s Howard / modified-policy-iteration
+    inner loop: after a full Bellman improvement (``bellman_step``), the
+    policy is held fixed for ``k_howard − 1`` cheap eval steps that
+    sharpen ``V`` toward the fixed point of ``T_σ`` before the next
+    improvement. Each call here is the cost of a single grid action
+    (``M = 1``), i.e. ``1 / N_a`` of an improvement step — so even
+    moderate ``k_howard`` (~10) typically pays for itself many times
+    over in fewer outer iterations.
+    """
+    # M = 1: each action is a single per-state value held fixed across
+    # the refinement. Reuses the broadcast machinery in
+    # ``_bellman_at_action_values``.
+    action_values = {name: val.unsqueeze(-1) for name, val in policy.items()}
+
+    if callable(ctx.discount):
+        disc_raw = ctx.discount(ctx.state_b_dict, t)
+        discount = torch.as_tensor(disc_raw, dtype=ctx.dtype, device=ctx.device)
+    else:
+        discount = ctx.discount
+
+    V_at_policy = _bellman_at_action_values(
+        ctx, V_next, t, action_values, discount, validate=False,
+    )
+    return V_at_policy.squeeze(-1)
+
+
 # Golden ratio conjugate: 1 / φ = (√5 − 1) / 2 ≈ 0.618. Each iteration of
 # the standard golden-section search contracts the bracket by this factor.
 _GOLDEN_PHI_INV = (math.sqrt(5.0) - 1.0) / 2.0

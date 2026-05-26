@@ -2,16 +2,23 @@
 
 Iterate the Bellman operator from an initial guess (``terminal_reward``
 if supplied, else zeros) until ``||V_new - V||_∞ < tol``, or until
-``max_iters`` is hit. The Bellman operator is a contraction with factor
-``γ`` (the discount), so convergence is geometric: ``error_n ≈ γ^n *
-error_0``. For ``γ=0.96`` and ``tol=1e-6``, expect ~300 iterations.
+``max_iters`` is hit.
 
-The name is "PolicyIteration" to match the documented API even though
-the algorithm under the hood is value iteration (i.e. iterating the
-Bellman operator directly). True alternating policy-iteration would
-also work and might converge faster on some problems, but value
-iteration is simpler and reuses the same per-step machinery as
-``BackwardInduction``.
+The default ``k_howard = 10`` runs **modified policy iteration**: each
+outer iteration is one Bellman *improvement* (a full ``max_a`` over
+actions, the expensive step) followed by ``k_howard − 1`` cheap
+Bellman *evaluations* at the just-improved policy (no max, just a
+single action per state). The eval step costs ``1 / N_a`` of an
+improvement, so a moderate ``k_howard`` is nearly free per outer iter
+but typically cuts the outer-iter count by ~5–50× on smooth contractive
+problems.
+
+``k_howard = 1`` reverts to plain value iteration (the historical
+behaviour). Very large ``k_howard`` (say 100+) approximates Howard's
+exact policy iteration, where each outer iter solves ``V = T_σ V`` to
+near-fixed-point before re-improving. The total Bellman applications
+are ``n_outer × k_howard``; the sweet spot trades improvement count
+against eval count.
 
 Requires ``problem.horizon is None``. The user's ``transition`` and
 ``reward`` callables receive ``t=None`` — they should not depend on time.
@@ -23,25 +30,34 @@ import torch
 
 from ..problem import Problem
 from ._common import (
-    _Policy, _Value, bellman_step, check_boundary_escape, setup_solve,
-    terminal_value,
+    _evaluate_at_policy, _Policy, _Value, bellman_step,
+    check_boundary_escape, setup_solve, terminal_value,
 )
 
 
 @dataclass(frozen=True)
 class PolicyIteration:
-    """Iterate the Bellman operator to convergence (value iteration).
+    """Modified policy iteration for infinite-horizon stationary problems.
 
     Attributes
     ----------
     n_quad : int
         Number of Gauss-Hermite quadrature nodes per shock dimension.
     tol : float
-        Convergence threshold on ``||V_new - V||_∞``.
+        Convergence threshold on ``||V_new - V||_∞`` between successive
+        outer iterations.
     max_iters : int
-        Safety cap on the number of Bellman iterations. Exceeding this
-        is a hard error (better to fail loudly than silently return a
+        Safety cap on the outer-iteration count. Exceeding this is a
+        hard error (better to fail loudly than silently return a
         non-converged answer).
+    k_howard : int
+        Number of Bellman applications per outer iteration: 1 full
+        improvement (``max_a``) followed by ``k_howard − 1`` evaluations
+        at the fixed policy. ``k_howard = 1`` reverts to plain value
+        iteration. Defaults to 10 — a sweet spot on most contractive
+        problems where each eval step is ``~1 / N_a`` of an improvement,
+        and the extra evals sharpen V enough to roughly halve the outer
+        iter count.
     boundary_check : bool
         After convergence, run one extra ``problem.transition`` call with
         the stationary optimal policy and warn if a non-trivial fraction
@@ -52,7 +68,14 @@ class PolicyIteration:
     n_quad: int = 7
     tol: float = 1e-6
     max_iters: int = 10_000
+    k_howard: int = 10
     boundary_check: bool = True
+
+    def __post_init__(self):
+        if self.k_howard < 1:
+            raise ValueError(
+                f"PolicyIteration requires k_howard >= 1, got {self.k_howard}"
+            )
 
 
 def _policy_iteration(
@@ -81,7 +104,14 @@ def _policy_iteration(
     policy_now: dict = {}
     delta = float("inf")
     for n_iter in range(solver.max_iters):
+        # Improvement step: full Bellman max → updated V and policy.
         V_new, policy_now = bellman_step(ctx, V, t=None)
+        # Policy-evaluation steps: hold the freshly-improved policy
+        # fixed and apply T_σ a further (k_howard − 1) times. Each is
+        # ~1/N_a the cost of bellman_step; the contraction here keeps V
+        # converging toward the fixed point of T_σ between improvements.
+        for _ in range(solver.k_howard - 1):
+            V_new = _evaluate_at_policy(ctx, V_new, policy_now, t=None)
         delta = (V_new - V).abs().max().item()
         V = V_new
         if delta < solver.tol:
