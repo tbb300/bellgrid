@@ -4,6 +4,63 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/) — the leading `0.`
 indicates the API may still change in non-additive ways before a `1.0` release.
 
+## [0.1.0a4] — 2026-05-27
+
+Two performance features, both opt-in and non-breaking: vectorized
+golden-section action search, and modified policy iteration for the
+infinite-horizon solver.
+
+### Added
+- **`GoldenSearch` action grid spec** — drop-in replacement for
+  `RegularGrid` in `action_grid` for continuous actions. Replaces
+  brute-force enumeration with a small seed grid (`n_init`, default 4)
+  plus vectorized golden-section refinement (`n_iter`, default 20) — run
+  lock-step across every state and every joint configuration of the
+  other actions. Single-fresh-eval-per-iter via the standard
+  golden-ratio trick, so the GPU work is one Bellman call per iter.
+  Multi-continuous problems get `n_coord` (default 2) outer rounds of
+  coordinate descent. Mixes naturally with `DiscreteAction` (enumerated
+  alongside) and with non-golden `RegularGrid` continuous actions. On a
+  warped-wealth log-utility Merton, golden with `n_init=4, n_iter=20`
+  saturates the wealth-grid precision floor at ~1/23rd the wall time of
+  a 500-point `RegularGrid` (same final precision).
+- **`k_howard` knob on `PolicyIteration`** — promotes the historical
+  value-iteration loop to **modified policy iteration**. Each outer
+  iteration is now one Bellman improvement (the expensive `max_a` step)
+  followed by `k_howard − 1` cheap Bellman evaluations at the
+  freshly-improved policy. Eval steps cost `~1 / N_a` of an improvement,
+  so even a moderate `k_howard` is nearly free per outer iter but cuts
+  the outer-iter count dramatically. Defaults to `k_howard=10`;
+  `k_howard=1` reverts to the previous value-iteration behaviour.
+  On infinite-horizon Merton (β=0.96, 64×200 grid, tol=1e-7), outer
+  iterations drop from 444 (`k=1`) → 51 (`k=10`, default) → 9 (`k=200`);
+  wall-clock goes from 5.95s → 0.52s → 0.24s on CPU.
+
+### Changed
+- **`SolveContext` carries the raw shock-node tensors, resolved action
+  bounds, and joint-axis strides** — needed by the new refinement paths
+  to rebuild Bellman broadcasts at arbitrary action values without
+  re-running shock setup. Additive on the dataclass; no public API
+  change.
+- **Internal: `_bellman_core` extracted from `_bellman_partial`**, so the
+  Bellman integrand can be evaluated at pre-broadcast tensors that come
+  from either the existing chunked grid path (`_bellman_partial`) or the
+  new per-state-value paths (`_bellman_at_action_values`). Shared by the
+  golden-search refinement and Howard's policy-evaluation step. No
+  behavioural change to the grid path.
+
+### Known limitations (carried over)
+- `GoldenSearch` combined with a non-golden `RegularGrid` large enough
+  to force action chunking will raise rather than silently regressing.
+  The refinement needs the full `state × N_a` accumulator; the
+  combination is also wasteful (full grid cost on the non-golden axis,
+  no speedup from golden) so an explicit error is preferable.
+- No implicit differentiation through the solver. Still planned.
+
+### Test count
+- 289 tests pass (up from 272 in 0.1.0a3; 9 new for `GoldenSearch`, 8
+  new for Howard).
+
 ## [0.1.0a3] — 2026-05-22
 
 No API changes. Ships the **full lifecycle planning example**, four
@@ -201,6 +258,7 @@ collecting feedback.
 - No infinite-horizon `MarkovChain` initial-state defaulting to the stationary
   distribution in `simulate()` (users pass an explicit category index for now).
 
+[0.1.0a4]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a4
 [0.1.0a3]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a3
 [0.1.0a2]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a2
 [0.1.0a1]: https://github.com/tbb300/bellgrid/releases/tag/v0.1.0a1
