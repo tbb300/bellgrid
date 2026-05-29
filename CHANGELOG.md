@@ -4,6 +4,48 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/) — the leading `0.`
 indicates the API may still change in non-additive ways before a `1.0` release.
 
+## [0.1.0a5] — 2026-05-29
+
+A correctness fix plus internal memory/performance work. No public API
+changes; existing solves are unaffected except where they previously crashed.
+
+### Fixed
+- **State-dependent callable discount no longer crashes `PolicyIteration`
+  or `GoldenSearch`.** A callable discount that depends on state (returns a
+  tensor, e.g. `torch.where(state["regime"] == 0, b0, b1)`) is evaluated on
+  the joint state mesh, so it arrives with size `N_a` on the action axis. The
+  two solver paths that re-use the Bellman machinery at a *different*
+  action-axis size — `PolicyIteration`'s Howard / modified-policy-iteration
+  inner loop (`M = 1`, hit whenever the default `k_howard = 10` is used) and
+  `GoldenSearch` refinement (`M = N_enum`) — broadcast the `N_a` discount
+  against the `M`-action value and raised a shape error. So *any*
+  infinite-horizon problem with a state-dependent callable discount failed out
+  of the box (only `k_howard = 1` worked), as did golden search with one.
+  Fixed centrally in `_bellman_at_action_values` by collapsing the discount's
+  action axis to 1 so it broadcasts to any `M`.
+
+### Changed
+- **Chunk-size budget accounts for the Markov kept-axis fan-out.** The
+  per-chunk working tensor is the pre-contraction lookup, which is
+  `prod(n_ms)`× larger than `state × action × shock`; the cap now divides by
+  that, so problems with sizable `MarkovChain`s chunk correctly instead of
+  silently under-counting and risking OOM. The accumulator-fits check stays
+  fan-out-free (the accumulator is post-contraction).
+- **Multilinear bracketing is no longer recomputed across the Markov axes.**
+  Non-Markov queries carry trailing size-1 markov dims rather than being
+  expanded to `lookup_shape`, so `searchsorted` + interp weights run at chunk
+  size and only the final gather broadcasts up — removing `prod(n_ms)`×
+  redundant work and the matching materialisation. `multilinear()` routes to
+  the compiled core on the broadcast output size.
+- **Per-chunk accumulation is in-place**, and **state-independent action
+  tensors** (fixed-bound continuous, all discrete) are kept as broadcast views
+  rather than materialised to the full `state × N_a`. Transition return-key
+  validation now runs once per Bellman step rather than once per chunk.
+
+### Test count
+- 291 tests pass (up from 289 in 0.1.0a4; 2 new regression tests covering the
+  callable-discount fix on the `PolicyIteration` and `GoldenSearch` paths).
+
 ## [0.1.0a4] — 2026-05-27
 
 Two performance features, both opt-in and non-breaking: vectorized
