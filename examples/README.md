@@ -63,6 +63,24 @@ or run the source `.py` files directly.
   within ~1e-3). For the American case, shows the jump premium and
   the lower exercise boundary that jumps induce (downward-biased
   jumps → more reason to hold).
+- `10_hydropower/hydropower.ipynb` — **the neural-solver example**:
+  multi-reservoir cascade hydropower scheduling under a **stochastic,
+  mean-reverting (OU/AR(1)) electricity price** — the textbook
+  curse-of-dimensionality stochastic DP. Each reservoir is a continuous
+  state and each release a continuous action with a state-dependent
+  bound (you can't release water you don't hold), and the price is one
+  more continuous state, so a grid needs (pts)^(N+1) × (pts)^N cells —
+  ~3e14 at N=4. Solved with `ActorCritic` (model-based neural solver)
+  behind the same `Problem`/`solve()` interface. Demonstrates the
+  correctness contract: **certified against the exact grid solver at
+  N=1** (a 2-D state — level × price), then **run at N=4 where no grid
+  can exist** (5-D state), self-validated by Monte-Carlo consistency
+  (the on-policy critic's reported value matches `simulate()`'s
+  discounted return of its own policy to ~5%). The payoff of the
+  stochastic price: the optimal release is a **policy that reacts to
+  the realized price** — sell into the spikes, hold through the lulls —
+  not a fixed schedule, so different sample paths release at different
+  times.
 
 The notebooks are auto-generated from the `.py` source files via
 `jupytext --to ipynb <file>.py`. Edit the `.py` (easier to diff,

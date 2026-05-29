@@ -1,12 +1,12 @@
 [project]
 name = "bellgrid"
 version = "0.1.0a5"
-description = "GPU-native backward-induction MDP solver for continuous-state stochastic dynamic programs."
+description = "GPU solver for stochastic dynamic programs: exact backward induction plus a model-based neural solver for high dimensions."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Tom Barrett" }]
-keywords = ["dynamic-programming", "bellman", "mdp", "backward-induction", "stochastic-control"]
+keywords = ["dynamic-programming", "bellman", "mdp", "backward-induction", "stochastic-control", "actor-critic", "neural-dp"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",

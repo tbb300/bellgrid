@@ -235,6 +235,28 @@ Defaults and required arguments: `state_grid` is required when there are continu
 
 `policy(state, t)` and `value(state, t)` are time-indexed for finite-horizon problems — the solver stores a separate V and π slice at each `t` in `horizon`. Pass `t=None` for infinite-horizon problems, where V and π are stationary. Both accept batched state dicts (equal-shaped tensors) and return batched actions and values; scalar dicts work too for one-off queries.
 
+### Neural solver (`ActorCritic`)
+
+For problems whose continuous-state dimension is too large to mesh, `ActorCritic` is a **model-based** neural alternative behind the *same* `Problem` and `solve()` interface. It samples states instead of gridding them and represents V and π as networks, so memory scales with network size rather than `∏ grid_points`.
+
+```python
+from bellgrid.rl import ActorCritic
+
+policy, value = solve(
+    problem,                              # same Problem object
+    solver=ActorCritic(n_quad=7, hidden=(64, 64), steps=300, seed=0),
+    device="cuda",
+)                                          # no state_grid / action_grid needed
+```
+
+It runs as a **backward sweep of regressions**: with `V_{t+1}` frozen (the terminal reward, then the trained critic from the next period), each period evaluates a candidate-action set (the actor's proposal + globally-sampled and locally-perturbed actions) against it, then **the actor improves toward the candidate-max action while the critic evaluates the actor's *own* action (on-policy)**. The shock expectation is the *exact* quadrature the grid solver uses (not a model-free bootstrap). Two properties matter: the candidate max keeps policy *improvement* independent of the critic's gradient (so the actor can't drift into regions where the critic mis-extrapolates), and the on-policy critic makes the reported `V` equal the value of the policy actually run — so it agrees with forward simulation by construction, the validation handle you use where no grid exists.
+
+**On-distribution training (`ergodic=True`, default).** Sampling training states uniformly over the box mis-fits the region the policy actually operates in, and the 1-step bootstrap then *compounds* that off-distribution error down the backward sweep — a tiny per-period bias that saturates into a large value gap on long horizons (e.g. ~15% at 60 steps). To prevent this, after a first uniform pass the solver simulates the policy forward, collects the visited states, and re-solves drawing training states from that buffer (mixed with `ergodic_mix` uniform draws for coverage). The critic is then accurate where it is evaluated, so the self-consistency gap stays small **and flat in the horizon** (~1% from 10 steps to 60). Costs `1 + ergodic_passes` backward sweeps; set `ergodic=False` to disable.
+
+The returned `(policy, value)` are the same callables as the grid solver, and `value.residual_by_t` exposes the per-period critic RMSE as a fit-quality proxy. Because it shares the `Problem` spec, the **grid solver certifies it**: on any problem small enough to solve both ways, compare the two — that overlap is what licenses trusting the neural solver where the grid can't run.
+
+**Scope / caveats.** v1 supports `ContinuousState` + `DiscreteState`, `ContinuousAction`, any shock, finite horizon, scalar or callable discount. `MarkovChain` states, `DiscreteAction`, and the infinite-horizon case raise `NotImplementedError` (use the grid solver). The solution is *approximate* — the action `max` is over a finite candidate set and the nets approximate V/π over the sampled region — and gradient/optimisation-based, so on a non-concave Bellman objective it finds a local optimum. It is accurate where V is smooth (LQG matches the Riccati closed form closely) and rougher where V is near-singular (e.g. log-utility as wealth→0). Always sanity-check against the grid solver where both run. On low-dimensional problems the grid solver is far faster and exact — `ActorCritic` is for the dimensions where gridding is infeasible.
+
 ## Simulating
 
 ```python
