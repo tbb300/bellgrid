@@ -1,6 +1,6 @@
 # bellgrid
 
-**Solve stochastic dynamic programs on the GPU.** Mixed continuous and discrete state, mixed continuous and discrete action. Two solvers behind one `Problem` spec: **exact** GPU backward induction, and a **model-based neural solver** for the high dimensions a grid can't reach — with the exact solver doubling as a built-in correctness oracle for the neural one.
+**Solve stochastic dynamic programs on the GPU.** Mixed continuous and discrete state, mixed continuous and discrete action. Two solvers behind one `Problem` spec: **exact** GPU backward induction, and a **model-based neural solver** for the higher dimensions where a grid becomes infeasible — with the exact solver doubling as a correctness oracle for the neural one wherever both can run.
 
 A bellgrid `Problem` specifies:
 
@@ -97,9 +97,9 @@ Reward is any scalar callable that matches your problem: utility maximisation, c
 - **Constraints are first-class.** Borrowing constraints, irreversible state transitions, state-dependent action bounds, mortality-driven discount factors, and warm-glow bequest rewards all fit into the `Problem` interface without RL-style penalty shaping.
 - **The solver and simulator share the same `transition` and `reward`.** You can't have a "the simulator was wrong" bug because the simulator literally calls the same callables the solver did.
 
-## Breaking the curse of dimensionality: the neural solver
+## Beyond the grid: the neural solver
 
-The grid is exact, but its cost is `∏ (points per dimension)` — hopeless past ~6 continuous state/action dimensions. For those, swap `BackwardInduction` for **`ActorCritic`**, a neural solver behind the **same `Problem`**: it represents `V` and `π` as networks over *sampled* states instead of a mesh, so cost scales with network size, not grid volume.
+The grid is exact, but its cost is `∏ (points per dimension)` — hopeless past ~6 continuous state/action dimensions. For those, swap `BackwardInduction` for **`ActorCritic`**, a neural solver behind the **same `Problem`**: it represents `V` and `π` as networks over *sampled* states instead of a mesh, so *memory* scales with network size, not grid volume. (Memory, not difficulty — it's an approximate, optimisation-trained method; the win is reach, and you lean on the certification below to trust it. Demonstrated here to ~1% on a 5-D / 5-year problem; reliability further out depends on the problem, which is exactly why the consistency check matters.)
 
 ```python
 from bellgrid.rl import ActorCritic
@@ -134,7 +134,7 @@ Ten canonical problems, each side-by-side with an analytical or numerical refere
 - **States**: `ContinuousState`, `DiscreteState`, `MarkovChain` (any number per problem; cost is additive in chains).
 - **Actions**: `ContinuousAction` (with optional state-dependent bounds), `DiscreteAction`.
 - **Shocks**: `Normal`, `Lognormal`, `MultivariateNormal` (Cholesky-rotated Gauss-Hermite), `Uniform` (Gauss-Legendre), `Categorical` (exact), `Jump` (Bernoulli-approximated Poisson with Normal log-magnitudes). Multiple independent shocks per problem combine via tensor-product quadrature.
-- **Solvers**: `BackwardInduction` (finite-horizon) and `PolicyIteration` (infinite-horizon stationary) — exact GPU grid sweeps with JIT-compiled multilinear interpolation and memory-chunked Bellman updates; **`ActorCritic`** — a model-based neural solver for high-dimensional finite-horizon problems (samples states, learns `V`/`π` as networks, trained on-distribution, certifiable against the grid). CPU or CUDA.
+- **Solvers**: `BackwardInduction` (finite-horizon) and `PolicyIteration` (infinite-horizon stationary) — exact GPU grid sweeps with JIT-compiled multilinear interpolation and memory-chunked Bellman updates; **`ActorCritic`** — a model-based neural solver for finite-horizon problems in dimensions where a grid is infeasible (samples states, learns `V`/`π` as networks, trained on-distribution, certifiable against the grid). CPU or CUDA.
 - **Diagnostics**: post-solve check that the optimal policy's next-state distribution stays inside the declared state range; warns if it doesn't (you set your grid too tight).
 - **Discount**: scalar, or a callable `(state, t) → tensor` for mortality / hazard-style problems.
 - **Reward signature**: 4-arg `(state, action, shock, t)` or 5-arg `(state, action, shock, t, next_state)` — for per-period bequests, terminal-style payoffs computed per period, etc.
@@ -146,7 +146,7 @@ Both solvers consume the same `Problem` and return the same `(policy, value)` ca
 
 | | `BackwardInduction` / `PolicyIteration` (grid) | `ActorCritic` (neural) |
 |---|---|---|
-| State-dim sweet spot | 1–6 continuous (+ discrete) | high-dimensional, where a grid is infeasible |
+| State-dim sweet spot | 1–6 continuous (+ discrete) | higher-dimensional, where a grid is infeasible |
 | Solution | Exact across the full grid | Approximate; trained on-distribution |
 | Tail / edge-case behavior | Correct by construction | Accurate where the policy visits — certify against the grid |
 | Speed at low dim | Milliseconds–seconds, and exact | Slower and approximate — prefer the grid here |
