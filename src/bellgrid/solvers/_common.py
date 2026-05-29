@@ -322,7 +322,14 @@ def setup_solve(
         elif val.ndim == 1 and val.shape[0] == N_a:
             val = val.view((1,) * K + (N_a,))
         bc = val.broadcast_to(target)
-        if _action_tensor_bytes <= _ACTION_MATERIALIZE_BYTES:
+        # Only contiguous-materialise genuinely *state-dependent* values (e.g.
+        # state-dependent action bounds, which carry a real size on some state
+        # axis). Fixed-bound continuous actions and all discrete actions are
+        # identical across states, so materialising them to the full
+        # state × N_a shape just burns memory and bandwidth — keep the
+        # broadcast view (downstream slicing/expand/gather read it fine).
+        state_dependent = any(val.shape[k] != 1 for k in range(K))
+        if state_dependent and _action_tensor_bytes <= _ACTION_MATERIALIZE_BYTES:
             return bc.contiguous()
         return bc
 
@@ -592,11 +599,14 @@ def _bellman_core(
     # has one extra "kept" axis per chain, appended in chain order.
     lookup_shape = chunk_shape + tuple(ctx.n_ms)
 
-    # Build the multilinear queries. We *don't* materialise the expanded
-    # views — multilinear's internal ops handle non-contiguous queries,
-    # and skipping the .contiguous() saves a large per-step memory
-    # allocation (in the lifecycle case, ~770 MB per query × 3 queries =
-    # 2.3 GB / period not written to GPU memory).
+    # Build the multilinear queries. Non-markov queries carry trailing
+    # size-1 axes for the markov kept-dims rather than being expanded to the
+    # full lookup_shape: the bracket (searchsorted + interp weights) is
+    # identical across the stride-0 markov axes, so computing it at chunk size
+    # and letting multilinear broadcast the gather up to lookup_shape avoids
+    # prod(n_ms)× redundant searchsorted work and the matching materialisation
+    # (in the lifecycle case, ~2.3 GB / period not written to GPU memory). The
+    # markov query itself stays a size-1-everywhere-but-its-kept-axis view.
     queries = []
     mc_idx = 0
     for name, kind, transform in zip(
@@ -608,28 +618,23 @@ def _bellman_core(
             )
             nv = nv.broadcast_to(chunk_shape)
             u_next = transform(nv)
-            if ctx.K_mc >= 1:
-                for _ in range(ctx.K_mc):
-                    u_next = u_next.unsqueeze(-1)
-                u_next = u_next.expand(lookup_shape)
+            for _ in range(ctx.K_mc):
+                u_next = u_next.unsqueeze(-1)
             queries.append(u_next)
         elif kind == "discrete":
             nv = torch.as_tensor(
                 next_state_dict[name], dtype=torch.long, device=ctx.device
             )
             nv = nv.broadcast_to(chunk_shape)
-            if ctx.K_mc >= 1:
-                for _ in range(ctx.K_mc):
-                    nv = nv.unsqueeze(-1)
-                nv = nv.expand(lookup_shape)
+            for _ in range(ctx.K_mc):
+                nv = nv.unsqueeze(-1)
             queries.append(nv)
         else:  # markov — solver-controlled
             n_mk = ctx.n_ms[mc_idx]
             arange = torch.arange(n_mk, dtype=torch.long, device=ctx.device)
             view_arange = [1] * len(lookup_shape)
             view_arange[len(chunk_shape) + mc_idx] = n_mk
-            arange_b = arange.view(view_arange).expand(lookup_shape)
-            queries.append(arange_b)
+            queries.append(arange.view(view_arange))
             mc_idx += 1
 
     V_lookup = multilinear(ctx.axes_for_lookup, V_next, queries)
@@ -657,6 +662,8 @@ def _bellman_partial(
     a_start: int,
     a_end: int,
     discount,
+    *,
+    validate: bool = True,
 ) -> torch.Tensor:
     """Contribution of shock nodes ``[q_start, q_end)`` and action chunk
     ``[a_start, a_end)`` to ``Σ_q (r + γ V) · w``.
@@ -709,7 +716,7 @@ def _bellman_partial(
         ctx, V_next, t,
         state_b=state_b, action_b=action_b, shock_b=shock_b,
         weights_b=weights_b, discount_chunk=discount_chunk,
-        chunk_shape=chunk_shape,
+        chunk_shape=chunk_shape, validate=validate,
     )
 
 
@@ -760,6 +767,17 @@ def _bellman_at_action_values(
         for name, nodes in ctx.shock_values.items()
     }
     weights_b = ctx.weights_b  # already shaped (1,)*K + (1, N_q)
+
+    # The discount is action-independent — β(s, t). A *state-dependent*
+    # callable discount is evaluated on ctx.state_b_dict, so it comes in at
+    # full_shape with size N_a on the action axis. This path's action axis is
+    # M (the candidate count: 1 for policy-evaluation, N_enum for the golden
+    # refinement), not N_a, so we collapse the discount's action axis to 1 and
+    # let it broadcast. Without this the multiply re-expands the action axis to
+    # N_a and the result blows up (crashing _evaluate_at_policy's squeeze and
+    # the golden-search refinement). Scalars and smaller tensors pass through.
+    if isinstance(discount, torch.Tensor) and discount.ndim == len(ctx.full_shape):
+        discount = discount[..., :1, :]
 
     return _bellman_core(
         ctx, V_next, t,
@@ -1102,20 +1120,30 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
     # ``chunk_size = 2**20`` (1M elements) on fp64 GPUs, the accumulator
     # may grow to 16M elements = 128 MB — comfortably small.
     ACCUMULATOR_MULTIPLIER = 16
-    elements_per_shock_full_action = state_count * ctx.N_a
+    # The accumulator is the post-contraction (state × N_a) Bellman tensor —
+    # no markov fan-out (markov current-state axes are already in state_count).
+    accumulator_elements = state_count * ctx.N_a
     accumulator_fits = (
-        elements_per_shock_full_action <= ctx.chunk_size * ACCUMULATOR_MULTIPLIER
+        accumulator_elements <= ctx.chunk_size * ACCUMULATOR_MULTIPLIER
     )
+    # The per-chunk WORKING tensor, by contrast, is the *pre-contraction*
+    # lookup: state × action_chunk × shock_chunk × prod(n_ms). Each markov
+    # chain adds a "kept" next-state axis, so the working set is prod(n_ms)×
+    # larger than state × action × shock. Size the shock/action chunks against
+    # that — otherwise the cap silently under-counts and OOMs on problems with
+    # sizable chains (the budget would be off by exactly prod(n_ms)).
+    mc_fanout = math.prod(ctx.n_ms) if ctx.n_ms else 1
+    working_per_shock_full_action = state_count * ctx.N_a * mc_fanout
     if accumulator_fits:
         # Shock-only chunking. Use as many shock nodes per chunk as
-        # the per-chunk budget allows.
-        chunk_n_q = max(1, ctx.chunk_size // max(elements_per_shock_full_action, 1))
+        # the per-chunk working budget allows.
+        chunk_n_q = max(1, ctx.chunk_size // max(working_per_shock_full_action, 1))
         chunk_n_a = ctx.N_a
     else:
         # Action chunking. Take one shock at a time so the per-chunk
-        # tensor is state_count × chunk_n_a × 1.
+        # working tensor is state_count × chunk_n_a × 1 × prod(n_ms).
         chunk_n_q = 1
-        chunk_n_a = max(1, ctx.chunk_size // max(state_count, 1))
+        chunk_n_a = max(1, ctx.chunk_size // max(state_count * mc_fanout, 1))
 
     full_q = (chunk_n_q >= ctx.N_q)
     full_a = (chunk_n_a >= ctx.N_a)
@@ -1140,6 +1168,9 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
             "or raise chunk_size."
         )
 
+    # The transition's return-key validation is structural (independent of
+    # which shock/action slice we evaluate), so validate only on the first
+    # _bellman_partial call of the step rather than once per chunk.
     if full_q and full_a:
         # Fast path: no chunking. Single _bellman_partial call, then
         # max over the action axis. Identical to pre-chunking behaviour.
@@ -1156,10 +1187,11 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
             ctx.state_dims_tup + (ctx.N_a,),
             dtype=ctx.dtype, device=ctx.device,
         )
-        for q_start in range(0, ctx.N_q, chunk_n_q):
+        for i_chunk, q_start in enumerate(range(0, ctx.N_q, chunk_n_q)):
             q_end = min(q_start + chunk_n_q, ctx.N_q)
-            bellman = bellman + _bellman_partial(
+            bellman += _bellman_partial(
                 ctx, V_next, t, q_start, q_end, 0, ctx.N_a, discount,
+                validate=(i_chunk == 0),
             )
         if has_golden:
             return _refine_with_golden_section(ctx, V_next, t, bellman, discount)
@@ -1176,12 +1208,15 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
         argmax = torch.zeros(
             ctx.state_dims_tup, dtype=torch.long, device=ctx.device,
         )
+        validated = False
         for a_start in range(0, ctx.N_a, chunk_n_a):
             a_end = min(a_start + chunk_n_a, ctx.N_a)
             if chunk_n_q >= ctx.N_q:
                 chunk_bellman = _bellman_partial(
                     ctx, V_next, t, 0, ctx.N_q, a_start, a_end, discount,
+                    validate=not validated,
                 )
+                validated = True
             else:
                 chunk_bellman = torch.zeros(
                     ctx.state_dims_tup + (a_end - a_start,),
@@ -1189,10 +1224,12 @@ def bellman_step(ctx: SolveContext, V_next: torch.Tensor, t) -> tuple[torch.Tens
                 )
                 for q_start in range(0, ctx.N_q, chunk_n_q):
                     q_end = min(q_start + chunk_n_q, ctx.N_q)
-                    chunk_bellman = chunk_bellman + _bellman_partial(
+                    chunk_bellman += _bellman_partial(
                         ctx, V_next, t,
                         q_start, q_end, a_start, a_end, discount,
+                        validate=not validated,
                     )
+                    validated = True
             chunk_max, chunk_argmax_rel = chunk_bellman.max(dim=-1)
             chunk_argmax = chunk_argmax_rel + a_start
             update = chunk_max > V_now

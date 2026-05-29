@@ -173,6 +173,15 @@ def multilinear(
                 f"continuous axis {k} must have at least 2 points"
             )
 
-    if queries[0].numel() >= _COMPILE_QUERY_THRESHOLD:
+    # Route on the *output* element count — the broadcast of all query
+    # shapes — not queries[0]. Callers may pass queries of differing
+    # (broadcast-compatible) shapes, e.g. the Bellman path leaves markov
+    # kept-axes as size-1 on the non-markov queries, so queries[0].numel()
+    # would undercount the real work (the gather is over the broadcast shape).
+    out_shape = torch.broadcast_shapes(*(q.shape for q in queries))
+    out_numel = 1
+    for d in out_shape:
+        out_numel *= d
+    if out_numel >= _COMPILE_QUERY_THRESHOLD:
         return _multilinear_core_compiled(axes, values, queries)
     return _multilinear_core(axes, values, queries)

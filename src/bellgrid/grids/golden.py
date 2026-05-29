@@ -8,13 +8,13 @@ configuration of the other actions.
 
 Cost per state per refined continuous action:
 
-    n_init + 2 + (n_iter - 1)   Bellman integrand evaluations
-                               (2 brackets; 1 fresh eval per iter via the
-                                standard "one of c, d carries over"
-                                golden-section trick)
+    n_init + 2 + n_iter   Bellman integrand evaluations
+                          (2 initial bracket evals; 1 fresh eval per iter via
+                           the standard "one of c, d carries over"
+                           golden-section trick)
 
 vs. ``n`` evaluations for a ``RegularGrid(n=n)``. ``n_init=4, n_iter=20``
-gives ~25 evals to a final bracket of ``(1 / golden_ratio)^20 ≈ 6.6e-5``
+gives ~26 evals to a final bracket of ``(1 / golden_ratio)^20 ≈ 6.6e-5``
 of one seed cell width — much sharper than a 500-point grid (relative
 precision ~2e-3) at ~1/20th the work.
 

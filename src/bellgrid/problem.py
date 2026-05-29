@@ -152,8 +152,9 @@ class Problem:
         range; ``PolicyIteration`` requires ``None``.
     discount
         Scalar ``β`` or a callable ``(state, t) -> β`` for state-dependent
-        discounting (e.g. mortality). Callable discount is documented but
-        not yet implemented.
+        discounting (e.g. mortality). Callable discount is supported by both
+        solvers (including ``PolicyIteration``'s Howard inner loop) and by
+        ``simulate``.
     terminal_reward
         Optional ``(state) -> reward`` evaluated at the post-horizon
         boundary in finite-horizon solves. Useful as a bequest motive or
