@@ -63,7 +63,66 @@ class ActorCritic:
         Quadrature nodes per shock dimension — the shock expectation is exact,
         as in the grid solver.
     hidden : tuple[int, ...]
-        Hidden-layer widths for both the actor and critic MLPs.
+        Hidden-layer widths for the actor MLP (and the critic too, unless
+        ``critic_hidden`` is set).
+    critic_hidden : tuple[int, ...] | None
+        Hidden-layer widths for the critic MLP. Defaults to ``hidden``. The
+        policy's accuracy is bounded by the critic's value fit (the actor
+        regresses onto the argmax of the critic), so for hard high-dimensional
+        problems it pays to make the critic much larger than the actor.
+    twin_critic : bool
+        Clipped double-critic (TD3-style; default ``False``). Trains two
+        independent critics per period and uses their elementwise **minimum** as
+        the continuation value (and the reported value). The actor regresses onto
+        ``argmax`` over candidate actions of ``E[r + V_{t+1}]``; that argmax
+        systematically selects actions where the critic *over-estimates*
+        (the optimizer's curse), and because the actor is trained toward it the
+        "on-policy" value inherits the bias and **compounds backward** through the
+        bootstrap — the source of the seed-dependent value blow-ups on hard
+        high-dimensional problems (the value can drift *above* the true optimum).
+        More samples don't help: the Bellman expectation is already exact
+        quadrature, so the error is approximation bias, not variance. Taking the
+        min of two critics with independent initialisations cancels the
+        per-critic over-estimation the argmax exploits, which is what makes the
+        backward recursion stable across seeds. Cost: a second critic (cheap
+        relative to the candidate search). See Fujimoto et al. 2018, "Addressing
+        Function Approximation Error in Actor-Critic Methods". This is the
+        ``n_critics=2, drop_top_atoms=1`` special case of the truncated ensemble
+        below; setting ``twin_critic=True`` is a convenience for exactly that.
+    n_critics : int
+        Size of the critic **ensemble** (default 1). The continuation value is the
+        *truncated mean* of the pooled atoms across all critics (see
+        ``drop_top_atoms``), generalising the twin-critic min to an arbitrary
+        ensemble (REDQ / TQC style). More critics give finer, lower-variance
+        control of the over-estimation bias than the binary min of two.
+    critic_quantiles : int
+        Quantile heads per critic (default 1 ⇒ a plain scalar critic). With
+        ``> 1`` each critic predicts a *distribution* over the return (the spread
+        induced by the shock), fit by quantile/pinball regression — the
+        distributional half of TQC (Kuznetsov et al. 2020). The pooled atoms used
+        for truncation are then ``n_critics × critic_quantiles``.
+    drop_top_atoms : int
+        How many of the highest pooled atoms to drop before averaging to form the
+        continuation value (default 0 ⇒ plain ensemble mean / single critic). This
+        is the **truncation** knob: a continuous version of the twin-critic min
+        (which is ``n_critics=2, drop_top_atoms=1``). Dropping the most optimistic
+        atoms removes exactly the over-estimation the actor's argmax would exploit,
+        with finer control than a hard min — raise it to be more conservative,
+        lower it to report a tighter (less pessimistic) value.
+    value_expansion : int
+        Horizon ``k`` of the **model-based value expansion** target (default 1 ⇒
+        the usual one-step bootstrap). With ``k > 1`` the continuation is computed
+        by rolling the *frozen* policy forward ``k-1`` steps through the known
+        model — accumulating exact per-step rewards and bootstrapping only at
+        ``V_{t+k}`` — instead of bootstrapping immediately at ``V_{t+1}``. Because
+        the model and the shock expectation are exact here (it's the ``Problem``'s
+        own ``transition``/``reward`` under quadrature, not a learned model), the
+        expansion is *unbiased* and strictly reduces the bootstrap's share of the
+        target, which is what compounds backward over the horizon. This is where
+        unlimited compute actually buys accuracy: each extra step costs a factor
+        ``n_quad`` (nested quadrature), fully parallel. See Feinberg et al. 2018,
+        "Model-Based Value Expansion". Keep ``k`` small (2–3); deep rollouts blow
+        up memory as ``n_quad^k``.
     activation : str
         ``"silu"`` (default), ``"tanh"``, ``"relu"``, or ``"gelu"``.
     state_samples : int
@@ -72,7 +131,33 @@ class ActorCritic:
         Gradient steps per period (each updates both nets against the
         candidate-max target).
     lr : float
-        Adam learning rate for both nets.
+        Adam learning rate for both nets (the initial rate when ``anneal_lr``).
+    anneal_lr : bool
+        Cosine-anneal the learning rate to ``lr * 1e-2`` over each period's
+        ``steps`` (default ``True``). A fixed LR leaves Adam jittering at a
+        few-percent relative-error noise floor; annealing drives the per-period
+        fit well below it. The benefit grows with ``steps``.
+    value_target : str
+        What the critic regresses onto. ``"on_policy"`` (default) fits the value
+        at the actor's own action, so ``V_θ`` equals the value of the policy
+        actually run (matches forward simulation by construction). ``"max"`` fits
+        the Bellman max (value at the candidate-argmax action), estimating the
+        *optimal* value directly — closer to an exact-DP oracle when the policy
+        is near-optimal, at the cost of the on-policy consistency guarantee.
+    inner_critic : int
+        Extra critic gradient steps per main step (default ``0``). The main step
+        runs the expensive candidate search (for the actor's argmax target) but
+        the critic only needs the *on-policy* value (``reward + V_{t+1}`` at the
+        actor's own action) — one cheap evaluation, no search. Each extra step
+        draws a fresh state batch and updates only the critic against that cheap
+        target, so the critic can reach the <1% fit a high-dimensional value
+        needs without paying the search cost on every update. The total critic
+        budget becomes ``steps × (1 + inner_critic)``.
+    log_every : int
+        If ``> 0``, print convergence telemetry every ``log_every`` gradient
+        steps (per period, per sweep): the critic RMSE in value units, the actor
+        regression loss, and the live (annealed) learning rate. ``0`` (default)
+        trains silently.
     n_global : int
         Globally-sampled candidate actions per state (uniform in the bounds) —
         gives the inner max global reach so it can't be trapped in a local basin.
@@ -113,7 +198,17 @@ class ActorCritic:
 
     n_quad: int = 7
     hidden: tuple = (64, 64)
+    critic_hidden: tuple | None = None
+    twin_critic: bool = False
+    n_critics: int = 1
+    critic_quantiles: int = 1
+    drop_top_atoms: int = 0
+    value_expansion: int = 1
     activation: str = "silu"
+    anneal_lr: bool = True
+    log_every: int = 0
+    value_target: str = "on_policy"
+    inner_critic: int = 0
     state_samples: int = 2048
     steps: int = 300
     lr: float = 2e-3
@@ -128,14 +223,11 @@ class ActorCritic:
     seed: int | None = None
 
 
-def _bellman_value(setup: RLSetup, state: dict, action: dict, t, value_next, discount):
-    """``E_w[ r(s, a, w, t) + β·V_{t+1}(f(s, a, w, t)) ]`` over the quadrature.
-
-    ``state``/``action`` are dicts of tensors sharing an arbitrary leading shape
-    ``S`` (``[B]`` for a plain batch, ``[B, M]`` for ``M`` candidate actions per
-    state); returns ``S``. The shock axis is appended and summed out with the
-    quadrature weights.
-    """
+def _bellman_integrand(setup: RLSetup, state: dict, action: dict, t, value_next, discount):
+    """Per-shock-node integrand ``r(s,a,w,t) + β·V_{t+1}(f(s,a,w,t))``, shape
+    ``S + (nq,)``, together with the quadrature weights ``[nq]``. Summing the
+    weighted integrand over the last axis gives the Bellman expectation; keeping it
+    un-summed gives the return distribution a quantile critic fits."""
     shape = next(iter(state.values())).shape
     nq = setup.n_q
     exp = shape + (nq,)
@@ -161,8 +253,19 @@ def _bellman_value(setup: RLSetup, state: dict, action: dict, t, value_next, dis
     else:
         d = discount
 
-    integrand = r + d * v_next
-    w = setup.shock_weights.view((1,) * len(shape) + (nq,))
+    return r + d * v_next, setup.shock_weights
+
+
+def _bellman_value(setup: RLSetup, state: dict, action: dict, t, value_next, discount):
+    """``E_w[ r(s, a, w, t) + β·V_{t+1}(f(s, a, w, t)) ]`` over the quadrature.
+
+    ``state``/``action`` are dicts of tensors sharing an arbitrary leading shape
+    ``S`` (``[B]`` for a plain batch, ``[B, M]`` for ``M`` candidate actions per
+    state); returns ``S``. The shock axis is appended and summed out with the
+    quadrature weights.
+    """
+    integrand, w = _bellman_integrand(setup, state, action, t, value_next, discount)
+    w = w.view((1,) * (integrand.ndim - 1) + (setup.n_q,))
     return (integrand * w).sum(dim=-1)
 
 
@@ -203,6 +306,74 @@ def _make_value_next(setup: RLSetup, critic_next):
     def value_next(next_state):
         with torch.no_grad():
             return critic_next(setup.featurize(_clamp_to_range(setup, next_state))).squeeze(-1)
+    return value_next
+
+
+class _TruncatedEnsemble:
+    """Continuation value = *truncated mean* of the pooled critic atoms (REDQ/TQC).
+
+    Pools every atom across the ``M`` critics (each contributing its
+    ``critic_quantiles`` heads), drops the ``drop_top`` largest, and averages the
+    rest. The actor's argmax selects the candidate maximising ``E[r + V_{t+1}]``,
+    which systematically picks actions where the critics *over-estimate*; dropping
+    the top atoms removes exactly that optimism, so the bias does not compound
+    backward. ``M=2, drop_top=1`` (a single scalar head each) recovers the
+    twin-critic min; ``M=1, drop_top=0`` is a plain single critic. Exposes the same
+    ``cont(features) -> value`` call as a scalar critic.
+    """
+
+    def __init__(self, critics, drop_top: int = 0):
+        self._critics = list(critics)
+        self._drop = int(drop_top)
+
+    def __call__(self, feat):
+        # Each critic returns its atoms with a trailing quantile axis [..., Q]
+        # (Q=1 for a scalar critic); concatenate into a pooled [..., M*Q].
+        atoms = torch.cat([c.atoms(feat) for c in self._critics], dim=-1)
+        keep = max(1, atoms.shape[-1] - self._drop)
+        if self._drop > 0 and keep < atoms.shape[-1]:
+            atoms = atoms.sort(dim=-1).values[..., :keep]   # drop the largest `drop`
+        return atoms.mean(dim=-1)
+
+
+def _rollout_value(setup: RLSetup, state: dict, tau: int, h: int,
+                   actors_by_t: dict, conts_by_t: dict):
+    """``k``-step model-based continuation: value of ``state`` at period ``tau``,
+    rolling the frozen on-policy actor forward (with exact quadrature) until the
+    bootstrap period ``h``, where it falls back to the truncated-ensemble critic
+    (or the terminal reward if ``h`` is the horizon end).
+
+    Each recursion level is one exact shock expectation, so the bootstrap's share
+    of the target shrinks geometrically and the per-step reward content — which is
+    *exact* here, not a learned model — replaces it. Depth is ``h - tau`` (≤ k-1).
+    """
+    horizon_len = len(list(setup.problem.horizon))
+    if tau >= h:                                            # bootstrap here
+        if h >= horizon_len:                                # ... at the terminal
+            tr = setup.problem.terminal_reward
+            sample = next(iter(state.values()))
+            if tr is None:
+                return torch.zeros(sample.shape, dtype=setup.dtype, device=setup.device)
+            out = tr(_clamp_to_range(setup, state))
+            return torch.as_tensor(out, dtype=setup.dtype, device=setup.device).broadcast_to(sample.shape)
+        return conts_by_t[h](setup.featurize(_clamp_to_range(setup, state)))   # ... at V_h
+    bounds = setup.resolve_bounds(state)
+    action = _actor_proposal(setup, actors_by_t[tau], state, bounds)
+    inner = lambda s2: _rollout_value(setup, s2, tau + 1, h, actors_by_t, conts_by_t)  # noqa: E731
+    return _bellman_value(setup, state, action, tau, inner, setup.discount)
+
+
+def _make_value_next(setup: RLSetup, t: int, k: int, actors_by_t: dict, conts_by_t: dict):
+    """Continuation callable for period ``t``: value of the *next* state (at
+    ``t+1``), via a ``k``-step rollout that bootstraps at ``min(t+k, T)``. For
+    ``k=1`` this is the ordinary one-step lookup of ``V_{t+1}`` (the terminal
+    reward at the last period)."""
+    horizon_len = len(list(setup.problem.horizon))
+    h = min(t + k, horizon_len)
+
+    def value_next(next_state):
+        with torch.no_grad():
+            return _rollout_value(setup, next_state, t + 1, h, actors_by_t, conts_by_t)
     return value_next
 
 
@@ -306,90 +477,135 @@ def _ergodic_sampler(setup: RLSetup, visited: dict, solver: ActorCritic, gen):
     return sample_fn
 
 
-def _backward_sweep(setup: RLSetup, solver: ActorCritic, gen, sample_fn):
+def _quantile_loss(pred_norm, target_norm, weights, taus):
+    """Quantile (pinball) regression of predicted atoms ``pred_norm`` ``[..., Q]``
+    onto the weighted return samples ``target_norm`` ``[..., nq]`` (quadrature
+    weights ``weights`` ``[nq]``, quantile fractions ``taus`` ``[Q]``). Both inputs
+    are in the critic's normalised space. Returns a scalar."""
+    u = target_norm.unsqueeze(-2) - pred_norm.unsqueeze(-1)          # [..., Q, nq]
+    tau = taus.view((1,) * (u.ndim - 2) + (taus.shape[0], 1))        # [..., Q, 1]
+    rho = u * (tau - (u < 0).to(u.dtype))                            # pinball
+    w = weights.view((1,) * (u.ndim - 1) + (weights.shape[0],))      # [..., 1, nq]
+    return (rho * w).sum(dim=-1).mean()
+
+
+def _backward_sweep(setup: RLSetup, solver: ActorCritic, gen, sample_fn, phase: str = ""):
     """One backward sweep over the horizon, drawing per-period training states
     from ``sample_fn(t)``. Returns ``(actors_by_t, critics_by_t, residual_by_t)``."""
-    problem = setup.problem
     device, dtype = setup.device, setup.dtype
     n_cont = len(setup.cont_actions)
-    horizon = list(problem.horizon)
+    horizon = list(setup.problem.horizon)
+
+    # Resolve the critic ensemble: M critics × Q quantile atoms, dropping the top
+    # `drop` pooled atoms for the continuation. `twin_critic` is the M=2, drop=1,
+    # Q=1 special case (its truncated mean of two atoms is the min). `k` is the
+    # value-expansion horizon.
+    M = 2 if solver.twin_critic else max(1, solver.n_critics)
+    drop = 1 if solver.twin_critic else solver.drop_top_atoms
+    Q = max(1, solver.critic_quantiles)
+    k = max(1, solver.value_expansion)
+    taus = (torch.arange(Q, device=device, dtype=dtype) + 0.5) / Q
 
     actors_by_t: dict = {}
+    conts_by_t: dict = {}        # period -> _TruncatedEnsemble (continuation value)
     critics_by_t: dict = {}
     residual_by_t: dict = {}
 
-    prev_actor = prev_critic = None
-    # Backward sweep: V_{t+1} frozen at each step (terminal reward, then critics).
-    for i, t in enumerate(reversed(horizon)):
-        value_next = _make_value_next(setup, None if i == 0 else prev_critic)
+    prev_actor = None
+    prev_critics = None
+    # Backward sweep: the continuation is frozen at each step (terminal reward,
+    # then the truncated-ensemble critics of the already-solved later periods).
+    for t in reversed(horizon):
+        value_next = _make_value_next(setup, t, k, actors_by_t, conts_by_t)
 
         actor = MLP(setup.n_feat, n_cont, solver.hidden, solver.activation).to(
             device=device, dtype=dtype
         )
-        critic = NormalizedCritic(
-            MLP(setup.n_feat, 1, solver.hidden, solver.activation)
-        ).to(device=device, dtype=dtype)
+        # M independently-initialised critics (each with Q quantile heads). They
+        # share targets/batches but differ in init, so their approximation-error
+        # surfaces differ; the truncated mean of the pooled atoms cancels the
+        # over-estimation the actor's argmax exploits.
+        critics = [
+            NormalizedCritic(
+                MLP(setup.n_feat, Q, solver.critic_hidden or solver.hidden, solver.activation)
+            ).to(device=device, dtype=dtype)
+            for _ in range(M)
+        ]
         if solver.warm_start and prev_actor is not None:
             actor.load_state_dict(prev_actor.state_dict())
-            critic.load_state_dict(prev_critic.state_dict())
+            for c, pc in zip(critics, prev_critics):
+                c.load_state_dict(pc.state_dict())
 
         opt_a = torch.optim.Adam(actor.parameters(), lr=solver.lr)
-        opt_c = torch.optim.Adam(critic.parameters(), lr=solver.lr)
+        opt_cs = [torch.optim.Adam(c.parameters(), lr=solver.lr) for c in critics]
+        # Cosine-anneal the LR to a small floor over the period's steps. With a
+        # fixed LR, Adam jitters around the optimum at a few-percent relative
+        # error (an SGD noise floor) regardless of net size — annealing drives
+        # the per-period fit far below that, which matters because the action is
+        # the critic's gradient and the per-period error compounds backward.
+        if solver.anneal_lr:
+            sch_a = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt_a, T_max=solver.steps, eta_min=solver.lr * 1e-2)
+            sch_cs = [torch.optim.lr_scheduler.CosineAnnealingLR(
+                oc, T_max=solver.steps * (1 + solver.inner_critic),
+                eta_min=solver.lr * 1e-2) for oc in opt_cs]
+        scheds = sch_cs if solver.anneal_lr else [None] * M
 
-        # Set the per-period value normalisation from one target sample. The
-        # critic fits the value at the actor's *own* action (candidate 0), so
-        # normalise from that, not from the candidate max.
+        def critic_loss(c, state):
+            """One critic's regression loss against the on-policy target at
+            ``state``: scalar MSE for Q=1, quantile/pinball for Q>1 (which needs
+            the per-shock return distribution, not just its mean)."""
+            feat = setup.featurize(state)
+            bnd = setup.resolve_bounds(state)
+            with torch.no_grad():
+                a_on = _actor_proposal(setup, actor, state, bnd)
+                integ, qw = _bellman_integrand(setup, state, a_on, t, value_next, setup.discount)
+            if Q == 1:
+                tgt = (integ * qw.view((1,) * (integ.ndim - 1) + (-1,))).sum(-1)  # E_w
+                return torch.mean((c.raw(feat).squeeze(-1) - c.normalize(tgt)) ** 2)
+            return _quantile_loss(c.raw(feat), c.normalize(integ), qw, taus)
+
+        # Per-period value normalisation from one on-policy sample (the value the
+        # critic actually fits — NOT the candidate max, which would bias the
+        # baseline above the target and compound over the sweep).
         with torch.no_grad():
             state = sample_fn(t)
             bounds = setup.resolve_bounds(state)
             cand = _candidate_actions(setup, actor, state, bounds, solver, gen)
-            state_b = {k: v.unsqueeze(-1).expand_as(next(iter(cand.values())))
-                       for k, v in state.items()}
+            state_b = {k_: v.unsqueeze(-1).expand_as(next(iter(cand.values())))
+                       for k_, v in state.items()}
             vals = _bellman_value(setup, state_b, cand, t, value_next, setup.discount)
-            # Normalise from the *on-policy* value the critic actually fits
-            # (vals[..,0], the value at the actor's own action) — NOT the
-            # candidate max. Setting the baseline mean above the fit target makes
-            # the net under-correct the offset and systematically overestimate;
-            # that per-period bias is tiny but COMPOUNDS over the backward sweep
-            # (≈5% at T=10 → ≈15% at T=60). Aligning the normalisation with the
-            # target keeps the per-period error zero-mean, so it no longer grows
-            # with the horizon.
-            onp = vals[..., 0]
-            critic.set_norm(onp.mean().item(), onp.std().item())
+            onp = vals[..., 0] if solver.value_target == "on_policy" else vals.max(dim=-1).values
+            for c in critics:
+                c.set_norm(onp.mean().item(), onp.std().item())
 
         last_resid = float("nan")
-        for _ in range(solver.steps):
+        for step in range(solver.steps):
             state = sample_fn(t)
             bounds = setup.resolve_bounds(state)
             with torch.no_grad():
-                # Candidate 0 is the actor's own proposal; the rest are global
-                # + local perturbations. We evaluate all against the frozen
-                # continuation, then split the targets two ways:
-                #   - actor improves toward the candidate-max action (argmax),
-                #   - critic evaluates the actor's *current* action (vals[..,0]).
-                # This on-policy critic target is the key to consistency: V_θ
-                # then equals the value of the policy actually run, so it matches
-                # forward simulation by construction (rather than the optimistic
-                # candidate-max, which the approximate actor can't fully attain).
+                # Candidate 0 is the actor's own proposal; the rest are global +
+                # local perturbations. The actor improves toward the candidate-max
+                # action (argmax); the critic fits the on-policy value (handled in
+                # critic_loss), so V_θ matches forward simulation by construction.
                 cand = _candidate_actions(setup, actor, state, bounds, solver, gen)
-                state_b = {k: v.unsqueeze(-1).expand_as(next(iter(cand.values())))
-                           for k, v in state.items()}
+                state_b = {k_: v.unsqueeze(-1).expand_as(next(iter(cand.values())))
+                           for k_, v in state.items()}
                 vals = _bellman_value(setup, state_b, cand, t, value_next, setup.discount)
-                actor_val = vals[..., 0]                          # value at π_φ(s)
                 best_idx = vals.max(dim=-1).indices               # [B]
                 a_target = {
-                    k: torch.gather(v, -1, best_idx.unsqueeze(-1)).squeeze(-1)
-                    for k, v in cand.items()
+                    k_: torch.gather(v, -1, best_idx.unsqueeze(-1)).squeeze(-1)
+                    for k_, v in cand.items()
                 }
 
             feat = setup.featurize(state)
 
-            # Critic: regress (normalised) value onto the actor's-action value.
-            pred_raw = critic.raw(feat)
-            loss_c = torch.mean((pred_raw - critic.normalize(actor_val)) ** 2)
-            opt_c.zero_grad(set_to_none=True)
-            loss_c.backward()
-            opt_c.step()
+            # Critic(s): regress onto the on-policy target (scalar or distributional).
+            for c, oc in zip(critics, opt_cs):
+                loss_c = critic_loss(c, state)
+                oc.zero_grad(set_to_none=True)
+                loss_c.backward()
+                oc.step()
 
             # Actor: regress (in normalised action space) onto the argmax action.
             raw = actor(feat)
@@ -401,37 +617,70 @@ def _backward_sweep(setup: RLSetup, solver: ActorCritic, gen, sample_fn):
             opt_a.zero_grad(set_to_none=True)
             loss_a.backward()
             opt_a.step()
+            if solver.anneal_lr:
+                sch_a.step()
+                for sc in sch_cs:
+                    sc.step()
 
-            last_resid = float(torch.sqrt(loss_c.detach()).item() * critic.std.item())
+            # Extra cheap critic updates on fresh batches: tighten the value fit
+            # (the policy's accuracy is bounded by it) and decorrelate the
+            # ensemble's errors so the truncation has real bite. No candidate
+            # search — just the on-policy target.
+            for _ in range(solver.inner_critic):
+                for c, oc, sc in zip(critics, opt_cs, scheds):
+                    lc = critic_loss(c, sample_fn(t))
+                    oc.zero_grad(set_to_none=True)
+                    lc.backward()
+                    oc.step()
+                    if sc is not None:
+                        sc.step()
 
-        # Bias-correct the critic: recenter so its *mean* residual against the
-        # on-policy target is zero on a fresh batch. A finite MSE fit can leave a
-        # small systematic offset, and while that offset is negligible per period
-        # it COMPOUNDS over the backward sweep — V_{t} inherits V_{t+1}'s offset
-        # plus its own — saturating at offset/(1-β) (≈11% at our scale). Zeroing
-        # the per-period mean residual keeps the error zero-mean, so the reported
-        # value stays accurate regardless of horizon. Cheap: one extra batch.
+            last_resid = float(torch.sqrt(loss_c.detach()).item() * critics[0].std.item())
+            if solver.log_every and (step + 1) % solver.log_every == 0:
+                lr_now = opt_cs[0].param_groups[0]["lr"]
+                print(
+                    f"  [{phase} t={t}] step {step + 1}/{solver.steps}  "
+                    f"critic_rmse≈{last_resid:.4f}  actor_loss={float(loss_a.detach()):.4f}  "
+                    f"lr={lr_now:.2e}",
+                    flush=True,
+                )
+
+        # Freeze, then bias-correct the *continuation* (the truncated-ensemble
+        # value) so its mean residual against the on-policy target is zero on a
+        # fresh batch. A finite fit leaves a small offset that COMPOUNDS over the
+        # sweep (V_t inherits V_{t+1}'s offset plus its own, saturating at
+        # offset/(1-β)); recentring the truncated mean keeps the reported value
+        # accurate at any horizon while preserving the per-state de-biasing of the
+        # truncation. Shifting every critic's mean by the same δ shifts the
+        # truncated mean by δ. Cheap: one extra batch.
+        for p in actor.parameters():
+            p.requires_grad_(False)
+        actor.eval()
+        for c in critics:
+            for p in c.parameters():
+                p.requires_grad_(False)
+            c.eval()
+        cont = _TruncatedEnsemble(critics, drop)
         with torch.no_grad():
             state = sample_fn(t)
             bounds = setup.resolve_bounds(state)
             cand = _candidate_actions(setup, actor, state, bounds, solver, gen)
-            state_b = {k: v.unsqueeze(-1).expand_as(next(iter(cand.values())))
-                       for k, v in state.items()}
-            onp = _bellman_value(setup, state_b, cand, t, value_next, setup.discount)[..., 0]
-            offset = (critic(setup.featurize(state)) - onp).mean()
-            critic.mean -= offset
-
-        for p in actor.parameters():
-            p.requires_grad_(False)
-        for p in critic.parameters():
-            p.requires_grad_(False)
-        actor.eval()
-        critic.eval()
+            state_b = {k_: v.unsqueeze(-1).expand_as(next(iter(cand.values())))
+                       for k_, v in state.items()}
+            bv = _bellman_value(setup, state_b, cand, t, value_next, setup.discount)
+            onp = bv[..., 0] if solver.value_target == "on_policy" else bv.max(dim=-1).values
+            diff = cont(setup.featurize(state)) - onp
+            last_resid = float(diff.pow(2).mean().sqrt())
+            delta = diff.mean()
+            for c in critics:
+                c.mean -= delta
 
         actors_by_t[t] = actor
-        critics_by_t[t] = critic
+        conts_by_t[t] = cont
+        critics_by_t[t] = cont
         residual_by_t[t] = last_resid
-        prev_actor, prev_critic = actor, critic
+        prev_actor = actor
+        prev_critics = critics
 
     return actors_by_t, critics_by_t, residual_by_t
 
@@ -445,17 +694,22 @@ def _actor_critic(problem, solver: ActorCritic, *, device, dtype: torch.dtype):
         torch.manual_seed(int(solver.seed))
 
     # Pass 1: uniform state sampling over the box.
+    if solver.log_every:
+        print("[sweep: uniform]", flush=True)
     uniform_fn = lambda t: setup.sample_states(solver.state_samples, gen)  # noqa: E731
-    actors, critics, residual = _backward_sweep(setup, solver, gen, uniform_fn)
+    actors, critics, residual = _backward_sweep(setup, solver, gen, uniform_fn, phase="uniform")
 
     # Ergodic refinement: re-solve on states the policy actually visits, so the
     # critic is accurate where it is evaluated and the bootstrap stops compounding
     # off-distribution error (the source of horizon-growing consistency gaps).
     if solver.ergodic:
-        for _ in range(solver.ergodic_passes):
+        for p in range(solver.ergodic_passes):
+            if solver.log_every:
+                print(f"[sweep: ergodic {p + 1}/{solver.ergodic_passes}]", flush=True)
             visited = _collect_visited(setup, actors, solver.ergodic_sim_paths, gen)
             actors, critics, residual = _backward_sweep(
-                setup, solver, gen, _ergodic_sampler(setup, visited, solver, gen)
+                setup, solver, gen, _ergodic_sampler(setup, visited, solver, gen),
+                phase=f"ergodic{p + 1}",
             )
 
     policy = _NeuralPolicy(setup, actors)

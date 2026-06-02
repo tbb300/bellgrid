@@ -47,10 +47,15 @@ class NormalizedCritic(nn.Module):
 
     Value functions can span hundreds of units (Merton's ``A + B·log w`` does),
     which makes a raw-MSE regression poorly conditioned. We fit the inner MLP to
-    ``(target − mean) / std`` and expose ``forward = mean + std·mlp(x)``, so the
-    rest of the solver (continuation-value lookups, the value callable) always
-    sees the true value. ``mean``/``std`` are set once per period from a target
-    sample (a PopArt-style trick, fixed per period rather than running).
+    ``(target − mean) / std`` and expose the un-normalized value, so the rest of
+    the solver (continuation-value lookups, the value callable) always sees the
+    true value. ``mean``/``std`` are set once per period from a target sample (a
+    PopArt-style trick, fixed per period rather than running).
+
+    The inner MLP may have ``Q`` outputs — the **quantile atoms** of the return
+    distribution (``Q=1`` is a plain scalar critic). All methods keep the trailing
+    ``[..., Q]`` axis; truncation/averaging across atoms happens in
+    ``_TruncatedEnsemble``.
     """
 
     def __init__(self, mlp: MLP):
@@ -67,8 +72,13 @@ class NormalizedCritic(nn.Module):
         return (target - self.mean) / self.std
 
     def raw(self, x: torch.Tensor) -> torch.Tensor:
-        """Inner MLP output in standardized space (what training regresses)."""
-        return self.mlp(x).squeeze(-1)
+        """Inner MLP atoms in standardized space ``[..., Q]`` (what training
+        regresses)."""
+        return self.mlp(x)
+
+    def atoms(self, x: torch.Tensor) -> torch.Tensor:
+        """Un-normalized quantile atoms ``[..., Q]``."""
+        return self.mean + self.std * self.mlp(x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mean + self.std * self.mlp(x).squeeze(-1)
+        return self.atoms(x)

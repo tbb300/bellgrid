@@ -82,6 +82,27 @@ or run the source `.py` files directly.
   not a fixed schedule, so different sample paths release at different
   times.
 
+- `11_liquidation/liquidation.ipynb` — **optimal execution, neural-vs-exact at
+  high dimension**: liquidate `N` correlated assets under temporary impact and a
+  mean-reverting signal, with a no-short / `v≤q` constraint. Linear impact makes
+  it an exact LQ, so the **matrix-Riccati closed form is analytical ground truth
+  at *any* N**. At one asset, grid + neural + Riccati agree (and the policy is
+  price-responsive — sell into strength). At **N=40 (80-D state, 40-D action),
+  each asset with its own factor loading and starting inventory** — an equivalent
+  grid of ~1e176 cells — the neural solver is certified three ways: it reproduces
+  the exact Riccati trade to ~0.01 per asset wherever the constraint is slack, its
+  reported value equals the policy's actual simulated return to ~1%, and that
+  return sits just below the unconstrained Riccati upper bound. Getting the value
+  to certify at 80-D needs a **truncated critic ensemble** (`n_critics`,
+  `drop_top_atoms` — REDQ/TQC-style, with TD3's clipped double-Q as the 2-critic
+  special case): the actor's argmax exploits the critic's own over-estimation and
+  the value compounds backward into a seed-dependent blow-up, and dropping the most
+  optimistic ensemble atoms cancels exactly that (model-based `value_expansion`
+  sharpens the policy further; distributional quantile critics, tested, don't help
+  in this exact-quadrature setting). Unlike the hydropower example (self-validated
+  by simulation), here the high-D answer is *known*, so this is certification
+  against exact truth where no grid can exist.
+
 The notebooks are auto-generated from the `.py` source files via
 `jupytext --to ipynb <file>.py`. Edit the `.py` (easier to diff,
 version-controllable as text), then regenerate the `.ipynb`.

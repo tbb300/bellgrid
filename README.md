@@ -114,7 +114,7 @@ Scope (v1): `ContinuousState` / `DiscreteState`, `ContinuousAction`, any shock, 
 
 ## Examples
 
-Ten canonical problems, each side-by-side with an analytical or numerical reference. Open the notebooks in JupyterLab or [view them on GitHub](https://github.com/tbb300/bellgrid/tree/main/examples).
+Eleven canonical problems, each side-by-side with an analytical or numerical reference. Open the notebooks in JupyterLab or [view them on GitHub](https://github.com/tbb300/bellgrid/tree/main/examples).
 
 | Notebook | Problem | Validates against |
 |---|---|---|
@@ -128,6 +128,7 @@ Ten canonical problems, each side-by-side with an analytical or numerical refere
 | [`08_jump_diffusion_option`](https://github.com/tbb300/bellgrid/blob/main/examples/08_jump_diffusion_option/jump_diffusion_option.ipynb) | American put under Merton (1976) jump-diffusion (`Jump` + `Normal`, multi-shock) | Merton 1976 European series expansion to ~1e-3 |
 | [`09_lifecycle_planning`](https://github.com/tbb300/bellgrid/blob/main/examples/09_lifecycle_planning/lifecycle_planning.ipynb) | Full lifecycle: consumption + retirement + asset allocation under mortality, regime-switching markets, warm-glow bequest | The motivating problem. Exercises every primitive at once. |
 | [`10_hydropower`](https://github.com/tbb300/bellgrid/blob/main/examples/10_hydropower/hydropower.ipynb) | Multi-reservoir hydropower under a stochastic OU price — **the neural-solver showcase** (`ActorCritic`) | Exact grid at N=1; forward-simulation consistency (~1%) at 5-D / 5-year, where no grid exists |
+| [`11_liquidation`](https://github.com/tbb300/bellgrid/blob/main/examples/11_liquidation/liquidation.ipynb) | Optimal execution of N correlated assets (Almgren–Chriss) — **neural certified against an exact high-D oracle** | Matrix-Riccati closed form: grid+neural+Riccati agree at N=1; at **N=40 (80-D, ~1e176 grid cells)** the neural value certifies to ~1% of its simulated return and reproduces the slack-region Riccati trade |
 
 ## What's built
 
