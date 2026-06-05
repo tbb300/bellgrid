@@ -713,6 +713,138 @@ def _backward_sweep(setup: RLSetup, solver: ActorCritic, gen, sample_fn, phase: 
     return actors_by_t, critics_by_t, residual_by_t
 
 
+def _backward_sweep_discrete(setup: RLSetup, solver: ActorCritic, gen, sample_fn,
+                             phase: str = ""):
+    """Backward sweep for *discrete* actions — fitted value iteration with the known
+    model, and no actor.
+
+    At each period the critic ``V_t`` regresses onto ``max_a E_w[r + β·V_{t+1}(f)]``
+    over the **enumerated** action grid (the ∏ nᵢ category combinations), and the
+    policy is the ``argmax_a`` of that same one-step lookahead. The max over the
+    grid is the discrete analogue of the continuous candidate-search argmax, and it
+    over-estimates for the same reason — it selects whichever action the critics are
+    most optimistic about — so the continuation is the truncated-ensemble value
+    (REDQ/TQC), which strips that optimism before it compounds backward. Enumeration
+    is ∏ nᵢ, so this is for *low-cardinality* discrete control over an arbitrary
+    (possibly high-dimensional) state. Returns ``(conts_by_t, residual_by_t,
+    action_grid)``; ``action_grid`` maps each action name to its ``[n_combos]``
+    category index per enumerated combination."""
+    device, dtype = setup.device, setup.dtype
+    horizon = list(setup.problem.horizon)
+    M = 2 if solver.twin_critic else max(1, solver.n_critics)
+    drop = 1 if solver.twin_critic else solver.drop_top_atoms
+    if max(1, solver.critic_quantiles) > 1:
+        raise NotImplementedError(
+            "discrete-action ActorCritic uses scalar critics (critic_quantiles=1); "
+            "the quantile critic is a continuous-action path"
+        )
+    if max(1, solver.value_expansion) > 1 or solver.search_expansion is not None:
+        raise NotImplementedError(
+            "discrete-action ActorCritic uses one-step targets (value_expansion=1); "
+            "multi-step model rollout under a discrete argmax policy is a follow-up"
+        )
+
+    # Enumerate the action grid: {name: [n_combos]} long tensors — the Cartesian
+    # product of each discrete action's category indices.
+    axes = [torch.arange(a.n, device=device) for a in setup.disc_actions]
+    mesh = torch.cartesian_prod(*axes) if len(axes) > 1 else axes[0].unsqueeze(-1)
+    if mesh.ndim == 1:
+        mesh = mesh.unsqueeze(-1)
+    n_combos = mesh.shape[0]
+    action_grid = {a.name: mesh[:, i].contiguous() for i, a in enumerate(setup.disc_actions)}
+
+    def q_over_grid(state, value_next, t):
+        """``Q(s, a) = E_w[r + β·V_{t+1}(f)]`` for every enumerated action: ``[B, A]``."""
+        lead = tuple(next(iter(state.values())).shape)
+        state_b = {k: v.unsqueeze(-1).expand(*lead, n_combos) for k, v in state.items()}
+        act_b = {nm: g.view(*([1] * len(lead)), n_combos).expand(*lead, n_combos)
+                 for nm, g in action_grid.items()}
+        return _bellman_value(setup, state_b, act_b, t, value_next, setup.discount)
+
+    conts_by_t: dict = {}
+    residual_by_t: dict = {}
+    prev_critics = None
+    for t in reversed(horizon):
+        value_next = _make_value_next(setup, t, 1, {}, conts_by_t)   # one-step V_{t+1}
+        critics = [
+            NormalizedCritic(
+                MLP(setup.n_feat, 1, solver.critic_hidden or solver.hidden, solver.activation)
+            ).to(device=device, dtype=dtype)
+            for _ in range(M)
+        ]
+        if solver.warm_start and prev_critics is not None:
+            for c, pc in zip(critics, prev_critics):
+                c.load_state_dict(pc.state_dict())
+        opt_cs = [torch.optim.Adam(c.parameters(), lr=solver.lr) for c in critics]
+        scheds = ([torch.optim.lr_scheduler.CosineAnnealingLR(
+                       oc, T_max=solver.steps * (1 + solver.inner_critic),
+                       eta_min=solver.lr * 1e-2) for oc in opt_cs]
+                  if solver.anneal_lr else [None] * M)
+
+        # Per-period value normalisation from one target sample (the max_a Q the
+        # critic actually fits).
+        with torch.no_grad():
+            tgt0 = q_over_grid(sample_fn(t), value_next, t).max(dim=-1).values
+            for c in critics:
+                c.set_norm(tgt0.mean().item(), tgt0.std().item())
+
+        last_resid = float("nan")
+        for step in range(solver.steps):
+            state = sample_fn(t)
+            with torch.no_grad():
+                target = q_over_grid(state, value_next, t).max(dim=-1).values   # [B]
+            feat = setup.featurize(state)
+            for c, oc, sc in zip(critics, opt_cs, scheds):
+                loss_c = torch.mean((c.raw(feat).squeeze(-1) - c.normalize(target)) ** 2)
+                oc.zero_grad(set_to_none=True)
+                loss_c.backward()
+                oc.step()
+                if sc is not None:
+                    sc.step()
+
+            # Extra cheap critic updates on fresh batches — tighten the fit and
+            # decorrelate the ensemble so the truncation has bite (mirrors the
+            # continuous sweep's inner_critic).
+            for _ in range(solver.inner_critic):
+                s2 = sample_fn(t)
+                with torch.no_grad():
+                    tg2 = q_over_grid(s2, value_next, t).max(dim=-1).values
+                f2 = setup.featurize(s2)
+                for c, oc, sc in zip(critics, opt_cs, scheds):
+                    lc = torch.mean((c.raw(f2).squeeze(-1) - c.normalize(tg2)) ** 2)
+                    oc.zero_grad(set_to_none=True)
+                    lc.backward()
+                    oc.step()
+                    if sc is not None:
+                        sc.step()
+
+            last_resid = float(torch.sqrt(loss_c.detach()).item() * critics[0].std.item())
+            if solver.log_every and (step + 1) % solver.log_every == 0:
+                print(f"  [{phase} t={t}] step {step + 1}/{solver.steps}  "
+                      f"critic_rmse≈{last_resid:.4f}", flush=True)
+
+        for c in critics:
+            for p in c.parameters():
+                p.requires_grad_(False)
+            c.eval()
+        cont = _TruncatedEnsemble(critics, drop)
+        # Bias-correct the truncated mean to the max_a Q target (same compounding
+        # argument as the continuous sweep: a per-period offset saturates at
+        # offset/(1-β) over the horizon).
+        with torch.no_grad():
+            state = sample_fn(t)
+            tgt = q_over_grid(state, value_next, t).max(dim=-1).values
+            diff = cont(setup.featurize(state)) - tgt
+            last_resid = float(diff.pow(2).mean().sqrt())
+            for c in critics:
+                c.mean -= diff.mean()
+        conts_by_t[t] = cont
+        residual_by_t[t] = last_resid
+        prev_critics = critics
+
+    return conts_by_t, residual_by_t, action_grid
+
+
 def _actor_critic(problem, solver: ActorCritic, *, device, dtype: torch.dtype):
     setup = build_setup(problem, solver.n_quad, device=device, dtype=dtype)
 
@@ -720,6 +852,19 @@ def _actor_critic(problem, solver: ActorCritic, *, device, dtype: torch.dtype):
     if solver.seed is not None:
         gen.manual_seed(int(solver.seed))
         torch.manual_seed(int(solver.seed))
+
+    if setup.disc_actions:
+        # Discrete actions: fitted value iteration (no actor; policy = argmax_a Q over
+        # the enumerated action grid). Uniform-sampled states; ergodic refinement is a
+        # continuous-only path for now.
+        uniform_fn = lambda t: setup.sample_states(solver.state_samples, gen)  # noqa: E731
+        if solver.log_every:
+            print("[sweep: uniform (discrete actions)]", flush=True)
+        conts, residual, action_grid = _backward_sweep_discrete(
+            setup, solver, gen, uniform_fn, phase="uniform")
+        value = _NeuralValue(setup, conts)
+        value.residual_by_t = residual
+        return _DiscretePolicy(setup, conts, action_grid), value
 
     # Pass 1: uniform state sampling over the box.
     if solver.log_every:
@@ -781,6 +926,36 @@ class _NeuralValue:
         with torch.no_grad():
             out = self._critics_by_t[t](self._setup.featurize(s)).squeeze(-1)
         return out.to(target_device)
+
+
+class _DiscretePolicy:
+    """``policy(state, t) -> {action: long tensor}`` for discrete actions.
+
+    Returns the ``argmax_a Q(s, a)`` of a one-step Bellman lookahead against the
+    trained continuation critic, evaluated over the enumerated action grid — the
+    same call interface as the grid solver's ``_Policy`` (each action's chosen
+    category index per state). Model-based at query time: it re-evaluates the known
+    transition/reward rather than storing a separate policy net."""
+
+    def __init__(self, setup: RLSetup, conts_by_t: dict, action_grid: dict):
+        self._setup = setup
+        self._conts_by_t = conts_by_t
+        self._action_grid = action_grid
+
+    def __call__(self, state: dict, t) -> dict:
+        setup = self._setup
+        target_device = _query_device(state, setup.state_names)
+        s = _to_setup_device(setup, state)
+        value_next = _make_value_next(setup, t, 1, {}, self._conts_by_t)
+        lead = tuple(next(iter(s.values())).shape)
+        n_combos = next(iter(self._action_grid.values())).shape[0]
+        state_b = {k: v.unsqueeze(-1).expand(*lead, n_combos) for k, v in s.items()}
+        act_b = {nm: g.view(*([1] * len(lead)), n_combos).expand(*lead, n_combos)
+                 for nm, g in self._action_grid.items()}
+        with torch.no_grad():
+            q = _bellman_value(setup, state_b, act_b, t, value_next, setup.discount)
+        best = q.argmax(dim=-1)                                  # [*lead]
+        return {nm: g[best].to(target_device) for nm, g in self._action_grid.items()}
 
 
 def _query_device(state: dict, state_names: list) -> torch.device:

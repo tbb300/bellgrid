@@ -9,10 +9,12 @@ warp definitions — so the two solver families share a problem spec without
 sharing machinery.
 
 Scope of v1 (enforced here): ``ContinuousState`` + ``DiscreteState`` states,
-``ContinuousAction`` actions, any supported shock, finite horizon, scalar or
-callable discount, 4- or 5-arg reward. ``MarkovChain`` states, ``DiscreteAction``
-actions, and the infinite-horizon (stationary) case raise ``NotImplementedError``
-with a pointer to the grid solver — they are planned follow-ups.
+``ContinuousAction`` *or* ``DiscreteAction`` actions (not a mix), any supported
+shock, finite horizon, scalar or callable discount, 4- or 5-arg reward. Discrete
+actions are enumerated and solved by fitted value iteration (no actor; see
+``_backward_sweep_discrete``). ``MarkovChain`` states, *mixed* continuous+discrete
+action spaces, and the infinite-horizon (stationary) case raise
+``NotImplementedError`` with a pointer to the grid solver — planned follow-ups.
 """
 
 import inspect
@@ -69,6 +71,7 @@ class RLSetup:
     state_names: list
 
     cont_actions: list
+    disc_actions: list = field(default_factory=list)
 
     # Per continuous state: (low, high, fwd, inv, u_low, u_high) for
     # normalisation (fwd, u_low, u_high) and warped-uniform sampling (inv).
@@ -164,19 +167,23 @@ def build_setup(problem: Problem, n_quad: int, *, device, dtype) -> RLSetup:
         raise NotImplementedError(
             "ActorCritic supports only ContinuousState and DiscreteState states"
         )
-    if any(isinstance(a, DiscreteAction) for a in problem.actions):
+    if any(not isinstance(a, (ContinuousAction, DiscreteAction)) for a in problem.actions):
         raise NotImplementedError(
-            "ActorCritic does not yet support DiscreteAction; use the grid solver"
+            "ActorCritic supports ContinuousAction and DiscreteAction actions"
         )
-    if any(not isinstance(a, ContinuousAction) for a in problem.actions):
-        raise NotImplementedError("ActorCritic supports only ContinuousAction actions")
     if not problem.actions:
         raise ValueError("Problem has no actions")
+    cont_actions = [a for a in problem.actions if isinstance(a, ContinuousAction)]
+    disc_actions = [a for a in problem.actions if isinstance(a, DiscreteAction)]
+    if cont_actions and disc_actions:
+        raise NotImplementedError(
+            "ActorCritic v1 takes either all-continuous or all-discrete actions, not "
+            "a mix; use the grid solver for a mixed action space"
+        )
 
     cont_states = [s for s in problem.states if isinstance(s, ContinuousState)]
     disc_states = [s for s in problem.states if isinstance(s, DiscreteState)]
     state_names = [s.name for s in cont_states + disc_states]
-    cont_actions = [a for a in problem.actions if isinstance(a, ContinuousAction)]
 
     cont_meta = {}
     n_feat = 0
@@ -231,7 +238,7 @@ def build_setup(problem: Problem, n_quad: int, *, device, dtype) -> RLSetup:
     return RLSetup(
         problem=problem, device=device, dtype=dtype,
         cont_states=cont_states, disc_states=disc_states, state_names=state_names,
-        cont_actions=cont_actions, _cont_meta=cont_meta,
+        cont_actions=cont_actions, disc_actions=disc_actions, _cont_meta=cont_meta,
         shock_nodes=shock_values, shock_weights=shock_weights, n_q=n_q,
         discount=discount, reward_takes_next_state=(n_pos == 5), n_feat=n_feat,
     )

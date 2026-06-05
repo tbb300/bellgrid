@@ -144,11 +144,70 @@ def test_markov_chain_rejected():
         solve(problem, solver=ActorCritic(), device="cpu")
 
 
-def test_discrete_action_rejected():
-    problem = _minimal([ContinuousState("x", range=(0.0, 1.0))],
-                       [DiscreteAction("d", n=3)])
-    with pytest.raises(NotImplementedError, match="DiscreteAction"):
+def test_mixed_actions_rejected():
+    """v1 takes all-continuous or all-discrete actions, not a mix."""
+    problem = _minimal(
+        [ContinuousState("x", range=(0.0, 1.0))],
+        [ContinuousAction("u", bounds=(0.0, 1.0)), DiscreteAction("d", n=3)],
+    )
+    with pytest.raises(NotImplementedError, match="all-continuous or all-discrete"):
         solve(problem, solver=ActorCritic(), device="cpu")
+
+
+def test_discrete_action_matches_grid():
+    """Discrete-action ActorCritic (fitted value iteration, argmax-Q policy) should
+    reproduce the grid oracle on a small lost-sales inventory problem: value within
+    a few percent and the discrete order policy matching almost everywhere."""
+    torch.manual_seed(0)
+    beta, mu_d, sigma_d = 0.97, 3.0, 1.2
+    price, hold, short_pen, order_cost, maxq = 2.0, 0.1, 1.5, 0.5, 5
+
+    def demand(shock):
+        return torch.clamp(mu_d + sigma_d * shock["z"], min=0.0)
+
+    def transition(state, action, shock, _t):
+        q = action["order"].to(state["inv"].dtype)
+        return {"inv": torch.clamp(state["inv"] + q - demand(shock), min=0.0)}
+
+    def reward(state, action, shock, _t):
+        q = action["order"].to(state["inv"].dtype)
+        d = demand(shock)
+        avail = state["inv"] + q
+        sold = torch.minimum(avail, d)
+        leftover = torch.clamp(avail - d, min=0.0)
+        short = torch.clamp(d - avail, min=0.0)
+        return price * sold - hold * leftover - short_pen * short - order_cost * q
+
+    problem = Problem(
+        states=[ContinuousState("inv", range=(0.0, 20.0))],
+        actions=[DiscreteAction("order", n=maxq + 1)],
+        transition=transition, reward=reward,
+        shocks=[Normal("z", sigma=1.0)],
+        horizon=range(0, 4), discount=beta,
+    )
+
+    pol_g, val_g = solve(
+        problem, state_grid={"inv": RegularGrid(n=400)}, action_grid={},
+        solver=BackwardInduction(n_quad=9), device="cpu",
+    )
+    pol_ac, val_ac = solve(
+        problem,
+        solver=ActorCritic(n_quad=9, twin_critic=True, steps=250,
+                           state_samples=2048, hidden=(128, 128), seed=0),
+        device="cpu",
+    )
+
+    xs = torch.linspace(0.5, 18.0, 40)
+    for t in range(4):
+        state = {"inv": xs}
+        vg, va = val_g(state, t), val_ac(state, t)
+        relmae = ((vg - va).abs().mean() / vg.abs().mean()).item()
+        match = (pol_g(state, t)["order"].long()
+                 == pol_ac(state, t)["order"].long()).float().mean().item()
+        # Value is the tight certification; the discrete policy can differ from the
+        # grid on the odd indifference-boundary cell (both actions near-optimal there).
+        assert relmae < 0.03, f"t={t} value relMAE {relmae:.3%}"
+        assert match >= 0.85, f"t={t} policy match {match:.1%}"
 
 
 def test_grid_solver_still_requires_grids():
