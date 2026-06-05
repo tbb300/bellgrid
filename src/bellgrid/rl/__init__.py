@@ -5,6 +5,7 @@ A function-approximation counterpart to the grid solvers that shares the same
 certified against the grid solver wherever both run. See ``ActorCritic``.
 """
 
+from .pgrad import PolicyGradient
 from .solver import ActorCritic
 
-__all__ = ["ActorCritic"]
+__all__ = ["ActorCritic", "PolicyGradient"]

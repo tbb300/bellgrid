@@ -3,8 +3,10 @@
 import torch
 
 from .problem import Problem
+from .rl.pgrad import PolicyGradient, _policy_gradient
 from .rl.solver import ActorCritic, _actor_critic
 from .solvers.backward_induction import BackwardInduction, _backward_induction
+from .solvers.ilqg import iLQG, _ilqg
 from .solvers.policy_iteration import PolicyIteration, _policy_iteration
 
 
@@ -54,6 +56,12 @@ def solve(
 
     if isinstance(solver, ActorCritic):
         return _actor_critic(problem, solver, device=device, dtype=dtype)
+
+    if isinstance(solver, PolicyGradient):
+        return _policy_gradient(problem, solver, device=device, dtype=dtype)
+
+    if isinstance(solver, iLQG):
+        return _ilqg(problem, solver, device=device, dtype=dtype)
 
     if isinstance(solver, (BackwardInduction, PolicyIteration)):
         if state_grid is None or action_grid is None:

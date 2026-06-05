@@ -1,7 +1,7 @@
 [project]
 name = "bellgrid"
 version = "0.1.0a6"
-description = "GPU solver for stochastic dynamic programs: exact backward induction plus a model-based neural solver for high dimensions."
+description = "GPU solver for stochastic dynamic programs: exact grid sweeps plus structure-matched high-dimensional solvers (iLQG, pathwise policy gradients, neural actor-critic) behind one Problem spec."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

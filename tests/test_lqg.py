@@ -26,8 +26,9 @@ from bellgrid import (
     solve,
 )
 from bellgrid.grids import RegularGrid
+from bellgrid.rl import PolicyGradient
 from bellgrid.shocks import Normal
-from bellgrid.solvers import BackwardInduction
+from bellgrid.solvers import BackwardInduction, iLQG
 
 
 # --- Riccati reference --------------------------------------------------
@@ -299,3 +300,137 @@ def test_lqg_print_comparison_table(lqg_solved):
 
     assert max_v_err < 0.2
     assert max_u_err < 0.15
+
+
+# --- iLQG: exact on LQ, no grid -----------------------------------------
+#
+# On an exactly linear-quadratic Problem, iLQG is a single Newton step on an
+# exact quadratic model, so it reproduces the closed-form Riccati value AND
+# policy to machine precision — a far tighter bar than the grid solver's
+# O(h^2) interpolation bias (5% above), and at any state dimension.
+
+
+@pytest.fixture(scope="module")
+def lqg_ilqg_solved():
+    problem = _build_lqg_problem()
+    policy, value = solve(problem, solver=iLQG(), device="cpu", dtype=torch.float64)
+    P_list, K_list, c_list = _riccati_lqg(
+        A_MAT, B_MAT, C_MAT, Q_MAT, R_MAT, GAMMA, T_HORIZON
+    )
+    return {"policy": policy, "value": value, "P": P_list, "K": K_list, "c": c_list}
+
+
+@pytest.mark.parametrize("t", [0, 7, 14])
+@pytest.mark.parametrize("x_pair", [(0.5, 0.5), (-0.5, 1.0), (1.5, -1.0), (-2.0, -2.0)])
+def test_ilqg_value_matches_riccati_to_machine_precision(lqg_ilqg_solved, x_pair, t):
+    x = np.array(x_pair, dtype=np.float64)
+    v_closed = _lqg_value(lqg_ilqg_solved["P"][t], lqg_ilqg_solved["c"][t], x)
+    state_q = {
+        "x1": torch.tensor([x[0]], dtype=torch.float64),
+        "x2": torch.tensor([x[1]], dtype=torch.float64),
+    }
+    v_il = lqg_ilqg_solved["value"](state_q, t=t).item()
+    # Riccati value (incl. the noise constant c_t) reproduced to ~1e-9.
+    assert v_il == pytest.approx(v_closed, rel=1e-8, abs=1e-8), (
+        f"x={x_pair}, t={t}: iLQG V={v_il:.10f}, riccati V={v_closed:.10f}"
+    )
+
+
+@pytest.mark.parametrize("t", [0, 7, 14])
+@pytest.mark.parametrize("x_pair", [(0.5, 0.5), (-0.5, 1.0), (1.5, -1.0), (-2.0, -2.0)])
+def test_ilqg_policy_matches_riccati(lqg_ilqg_solved, x_pair, t):
+    x = np.array(x_pair, dtype=np.float64)
+    u_closed = _lqg_action(lqg_ilqg_solved["K"][t], x)
+    state_q = {
+        "x1": torch.tensor([x[0]], dtype=torch.float64),
+        "x2": torch.tensor([x[1]], dtype=torch.float64),
+    }
+    u_il = lqg_ilqg_solved["policy"](state_q, t=t)["u"].item()
+    # The feedback gain is exact; the residual is the sqrt(eps) nominal-offset
+    # convergence floor.
+    assert u_il == pytest.approx(u_closed, rel=1e-6, abs=1e-6), (
+        f"x={x_pair}, t={t}: iLQG u={u_il:.8f}, riccati u={u_closed:.8f}"
+    )
+
+
+def test_ilqg_rejects_out_of_scope():
+    """iLQG declines non-continuous / infinite-horizon problems with a pointer
+    to the grid solver, rather than silently mis-solving."""
+    from bellgrid import DiscreteState
+
+    base = _build_lqg_problem()
+    # infinite horizon
+    inf = Problem(
+        states=base.states, actions=base.actions, transition=base.transition,
+        reward=base.reward, shocks=base.shocks, horizon=None, discount=GAMMA,
+    )
+    with pytest.raises(NotImplementedError, match="finite-horizon"):
+        solve(inf, solver=iLQG(), device="cpu")
+
+    # discrete state
+    disc = Problem(
+        states=[*base.states, DiscreteState("regime", n=2)],
+        actions=base.actions, transition=base.transition, reward=base.reward,
+        shocks=base.shocks, horizon=range(0, T_HORIZON), discount=GAMMA,
+    )
+    with pytest.raises(NotImplementedError, match="ContinuousState"):
+        solve(disc, solver=iLQG(), device="cpu")
+
+
+# --- PolicyGradient: pathwise gradient, near-optimal, no critic ----------
+#
+# The pathwise / analytic policy-gradient solver backpropagates the return
+# through the differentiable model — no learned critic, no bootstrap, none of the
+# overestimation machinery. It converges to a near-optimal policy (a trained net,
+# so within a few percent of the closed-form Riccati, not machine precision).
+
+
+@pytest.fixture(scope="module")
+def lqg_pgrad_solved():
+    problem = _build_lqg_problem()
+    policy, value = solve(
+        problem,
+        solver=PolicyGradient(steps=300, batch=2048, hidden=(64, 64),
+                              value_samples=2048, seed=0),
+        device="cpu", dtype=torch.float64,
+    )
+    P_list, K_list, c_list = _riccati_lqg(
+        A_MAT, B_MAT, C_MAT, Q_MAT, R_MAT, GAMMA, T_HORIZON
+    )
+    return {"policy": policy, "value": value, "P": P_list, "K": K_list, "c": c_list}
+
+
+@pytest.mark.parametrize("x_pair", [(0.5, 0.5), (-0.5, 1.0), (1.5, -1.0), (-2.0, -2.0)])
+def test_pgrad_converges_near_riccati(lqg_pgrad_solved, x_pair):
+    x = np.array(x_pair, dtype=np.float64)
+    state_q = {
+        "x1": torch.tensor([x[0]], dtype=torch.float64),
+        "x2": torch.tensor([x[1]], dtype=torch.float64),
+    }
+    # value (an honest MC rollout of the trained policy) within ~10% of Riccati
+    v_pg = lqg_pgrad_solved["value"](state_q, t=0).item()
+    v_ric = _lqg_value(lqg_pgrad_solved["P"][0], lqg_pgrad_solved["c"][0], x)
+    assert v_pg == pytest.approx(v_ric, rel=0.12, abs=0.5), (
+        f"x={x_pair}: pgrad V={v_pg:.4f}, riccati V={v_ric:.4f}"
+    )
+    # policy near the closed-form optimum
+    u_pg = lqg_pgrad_solved["policy"](state_q, t=0)["u"].item()
+    u_ric = _lqg_action(lqg_pgrad_solved["K"][0], x)
+    assert abs(u_pg - u_ric) < 0.4, (
+        f"x={x_pair}: pgrad u={u_pg:.4f}, riccati u={u_ric:.4f}"
+    )
+
+
+def test_pgrad_rejects_out_of_scope():
+    """PolicyGradient needs a differentiable model: discrete states break the
+    pathwise gradient, so it declines them with a pointer to the alternatives."""
+    from bellgrid import DiscreteState
+
+    base = _build_lqg_problem()
+    disc = Problem(
+        states=[*base.states, DiscreteState("regime", n=2)],
+        actions=base.actions, transition=base.transition, reward=base.reward,
+        shocks=base.shocks, horizon=range(0, T_HORIZON), discount=GAMMA,
+    )
+    with pytest.raises(NotImplementedError, match="ContinuousState"):
+        solve(disc, solver=PolicyGradient(steps=1), device="cpu")

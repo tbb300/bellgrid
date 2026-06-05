@@ -12,15 +12,26 @@
 # ---
 
 # %% [markdown]
-# # Optimal execution — certifying the neural solver against an *exact* high-D oracle
+# # Optimal execution — the right tool vs. the general tool, against an *exact* high-D oracle
 #
 # This example exploits a rare gift: the linear-impact optimal-execution problem
-# is **linear-quadratic**, so it has a closed-form solution (a matrix Riccati
-# recursion) at *any* dimension. That lets us certify the neural `ActorCritic`
-# solver against **exact analytical truth at 40 assets** — an 80-dimensional
-# state — where a grid would need `(points)^80` cells and is unthinkable.
-# (Contrast the hydropower example, where at high D we could only self-validate
-# by simulation; here we have the real answer.)
+# is **linear-quadratic**, which buys two things at *any* dimension — a closed-form
+# **oracle** (a matrix Riccati recursion) to check against, and a structure-
+# appropriate **solver**, `iLQG`, that exploits the LQ-ness to *hit* that oracle.
+# We run the same `Problem` spec through two solvers at an 80-dimensional state,
+# where a grid would need `(points)^80` cells and is unthinkable:
+#
+#  - **`iLQG`** — the *right tool* here. On an LQ problem it is a single Newton
+#    step (the Riccati solution), so it matches the oracle to **machine precision,
+#    in seconds**, at 80-D.
+#  - **`ActorCritic`** — the *general* tool. It assumes **no** structure (it would
+#    treat a non-LQ, non-smooth, or discrete problem identically), so it only
+#    *approximates* (~2%) — but this is the rare chance to certify a high-D *neural*
+#    solver against exact truth, so you can trust it on the many problems where no
+#    oracle exists (contrast the hydropower example, self-validated by simulation).
+#
+# The lesson worth keeping: **route a `Problem` to the method its structure
+# admits.** Same spec, very different cost and accuracy.
 #
 # ## The problem (stochastic Almgren–Chriss)
 #
@@ -49,7 +60,7 @@ import torch
 from bellgrid import ContinuousAction, ContinuousState, Problem, simulate, solve
 from bellgrid.grids import RegularGrid
 from bellgrid.shocks import Normal
-from bellgrid.solvers import BackwardInduction
+from bellgrid.solvers import BackwardInduction, iLQG
 from bellgrid.rl import ActorCritic
 
 torch.manual_seed(0)
@@ -199,17 +210,19 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ## 2. N = 40 assets — neural vs the *exact* matrix Riccati, at 80-D
+# ## 2. Forty assets at 80-D — the general tool (neural), certified
 #
 # Forty assets, each with its own factor loading `b_i` and starting inventory
 # `q0_i` (see `hetero`), so the assets are genuinely *distinct* — an 80-dimensional
 # state and a 40-dimensional action. An equivalently-resolved grid would need the
-# cell count below — there isn't enough matter in the universe. The Riccati solves
-# it exactly in milliseconds; the neural solver, behind the same `Problem` spec, in
-# minutes on a GPU.
+# cell count below — there isn't enough matter in the universe.
 #
-# With no grid to compare against at 80-D, we certify the neural solver **three**
-# ways against the exact Riccati — a stronger bar than "the value looks right":
+# Start with the **general** solver, `ActorCritic` — the one you'd reach for on a
+# problem *without* an LQ oracle. It assumes no structure and solves the full
+# **constrained** problem (the no-short bound `0 ≤ v ≤ q`). With no grid to compare
+# against at 80-D, we certify it **three** ways against the exact Riccati — a
+# stronger bar than "the value looks right" (then §3 shows what the *right* tool,
+# `iLQG`, does on the same problem):
 #
 #  1. **Policy where the constraint is slack.** Where the unconstrained Riccati
 #     trade is strictly interior (`0 < v* < q`), it *is* the constrained optimum,
@@ -406,36 +419,71 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
+# ## 3. The right tool — `iLQG`, exact on the LQ structure
+#
+# Everything above — the critic ensemble, value expansion, the value-vs-trade
+# subtlety — is what it takes to make the *assumption-free* solver trustworthy at
+# 80-D. But this problem *has* structure, and the structure-appropriate solver
+# exploits it. `iLQG` builds the local quadratic model of the value from autograd
+# derivatives of the same `transition`/`reward`; on an LQ problem that model is
+# *exact*, so a single Newton step **is** the Riccati solution. It matches the
+# oracle to machine precision in seconds — not "close to truth", the exact answer
+# to floating point — at any dimension.
+#
+# (v1 solves the *unconstrained* relaxation, which is the true optimum exactly
+# where the no-short constraint is slack; the binding case is control-limited DDP,
+# a planned follow-up. So `iLQG` certifies the slack region exactly, complementing
+# the neural solver's certification of the full constrained problem above.)
+
+# %%
+t0 = time.time()
+pol_il, val_il = solve(probN, solver=iLQG(x0=init))
+print(f"N={N} iLQG solve: {time.time() - t0:.1f}s  (vs the {N}-asset neural solve above)")
+
+# Certify against the exact unconstrained Riccati: feedback gains at random states,
+# and the value at s0 (which includes the noise constant c_0).
+torch.manual_seed(1)
+gain_err = 0.0
+for t in range(T):
+    z = torch.randn(8, 2 * N, dtype=torch.float64)
+    stq = {**{f"q{i}": z[:, i] for i in range(N)},
+           **{f"P{i}": z[:, N + i] for i in range(N)}}
+    u_il = np.stack([pol_il(stq, t)[f"v{i}"].cpu().numpy() for i in range(N)], -1)
+    gain_err = max(gain_err, float(np.abs(u_il - z.numpy() @ KN[t].T).max()))
+Vil0 = float(val_il({k: torch.tensor([v], dtype=torch.float64)
+                     for k, v in init.items()}, 0))
+print(f"iLQG vs exact Riccati: feedback gains match to {gain_err:.1e}; "
+      f"value V(s0) = {Vil0:.6f} vs Riccati {Vric0:.6f}  (|diff| {abs(Vil0 - Vric0):.1e})")
+
+# %% [markdown]
 # ## Takeaway
 #
 # The linear-impact execution problem is an exact LQ, so its matrix-Riccati
-# solution is **analytical ground truth at any dimension**. At **40 distinct assets
-# / 80 state dimensions** — a regime no grid can touch — the neural solver behind
-# the same `Problem` spec passes all three checks: it reproduces the closed-form
-# optimal trade to ~0.01 per asset wherever the constraint is slack, its reported
-# value equals the policy's actual simulated return to a fraction of a percent, and
-# that return sits
-# just below the unconstrained Riccati — the genuine price of the no-short /
-# can't-oversell constraint the solver honours and the closed form ignores. At one
-# asset it agrees with both the grid and the closed form too.
+# solution is **analytical ground truth at any dimension** — and the same `Problem`
+# spec runs through two solvers that meet that truth very differently:
 #
-# The subtlety worth keeping: at high D the naive single-critic value
-# **over-estimates and compounds backward** (the actor's argmax exploits the
-# critic's own approximation error), which more samples cannot cure because the
-# Bellman expectation is already exact. The fix is a **truncated critic ensemble**
-# (drop the most optimistic atoms) — the modern, finer-grained successor to TD3's
-# clipped double-Q — which turns the 80-D value from a seed-dependent ~6% blow-up
-# into a stable ~1% number. Model-based value expansion then leans on that critic less
-# still — a diagnostic pinned the residual high-D gap on critic approximation error,
-# not the candidate search — taking the value-consistency to ~0.1%;
-# distributional quantile critics, by contrast, buy nothing here (the bias is
-# cross-estimate optimism, not shock variance). Same `Problem`, three knobs.
+#  - **`iLQG`**, the structure-appropriate tool, *is* Newton's method on the exact
+#    quadratic, so it reproduces the Riccati gains and value to **machine precision
+#    in seconds** at 80-D. The right tool doesn't approximate the answer; it *is*
+#    the answer.
+#  - **`ActorCritic`**, the assumption-free tool, only *approximates* (~2%), and
+#    needs real machinery to be trustworthy at 80-D. The naive single-critic value
+#    **over-estimates and compounds backward** (the argmax exploits the critic's own
+#    approximation error), which more samples cannot cure because the Bellman
+#    expectation is already exact. A **truncated critic ensemble** (drop the most
+#    optimistic atoms — the finer-grained successor to TD3's clipped double-Q) turns
+#    a seed-dependent ~6% blow-up into a stable ~1%; **model-based value expansion**
+#    then leans on the learned critic less still, taking value-consistency to ~0.1%.
+#    The payoff: this — certified *here* against exact truth — is what you can trust
+#    on the many problems where no oracle exists.
 #
-# This is the strongest form of the certification story: not "self-consistent
-# under simulation," but "matches the *exact* answer" — in a dimension where the
-# exact answer can only be reached analytically, never by gridding.
+# That is the lesson worth keeping: **route a `Problem` to the method its structure
+# admits.** Both solvers sit behind the identical spec, and at one asset both also
+# agree with the grid; what separates them is entirely the structure each chooses to
+# exploit — paid for in cost and accuracy.
 #
 # **Next:** swap the quadratic impact `η·v²` for a nonlinear square-root law
-# `η·|v|^{3/2}` (the empirically observed shape). That breaks the LQ structure —
-# no closed form — so the grid certifies the neural solver at one asset, and the
-# neural solver runs at 40 where neither a grid nor a Riccati exists.
+# `η·|v|^{3/2}` (the empirically observed shape). That breaks the LQ structure — no
+# Riccati, no exact-iLQG shortcut — which is exactly when the *general* tool earns
+# its keep: the grid certifies the neural solver at one asset, and the neural solver
+# runs at 40 where neither a grid nor a closed form exists.
