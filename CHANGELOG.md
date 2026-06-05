@@ -4,6 +4,41 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/) — the leading `0.`
 indicates the API may still change in non-additive ways before a `1.0` release.
 
+## [0.1.0a6] — 2026-06-05
+
+Debuts the neural dynamic-programming solver: a model-based actor–critic for
+high-dimensional problems no grid can reach, with a worked example that certifies
+it against an exact analytical oracle at 80 state dimensions.
+
+### Added
+- **`ActorCritic` solver** — a model-based actor–critic that runs behind the same
+  `Problem` spec as the grid solvers, so a grid solve can *certify* it wherever
+  both run. Finite-horizon backward sweep with exact-quadrature Bellman targets
+  (the model and the shock expectation are the `Problem`'s own, not learned).
+- **Overestimation / compounding controls on `ActorCritic`** (all composable):
+  - `twin_critic` — clipped double-Q (TD3, Fujimoto et al. 2018).
+  - `n_critics` + `drop_top_atoms` — truncated critic ensemble (REDQ/TQC): pool
+    the critics and drop the most optimistic atoms, removing the over-estimation
+    the actor's argmax exploits before it compounds backward over the horizon.
+    At 80-D this pulls the reported value from a seed-dependent ~6% off to ~1%.
+  - `value_expansion` + `search_expansion` — model-based value expansion: roll the
+    *exact* model forward `k` steps before bootstrapping, shrinking the bootstrap's
+    (critic-error) share of the target. `search_expansion` decouples the dearer
+    candidate-search horizon from the critic-target horizon so deeper, low-bias
+    targets stay affordable at high dimension.
+  - `critic_quantiles` — distributional (TQC-style) critic atoms.
+- **`examples/11_liquidation`** — optimal execution (stochastic Almgren–Chriss).
+  Linear impact ⇒ exact LQ ⇒ a matrix-Riccati closed form is ground truth at any
+  dimension, so the example certifies `ActorCritic` at 40 assets / 80-D — where no
+  grid can exist — three ways: policy match where the no-short constraint is slack,
+  value-vs-Monte-Carlo consistency (~0.3%), and optimality vs the Riccati bound
+  (~1.8%). Includes a "trade-rate error ≠ value error" analysis: the objective is
+  flat in the trade near the optimum (envelope theorem), so a ~23%-median trade
+  deviation forfeits only ~0.005% of the total return.
+
+### Changed
+- CI release actions bumped to Node 24 (`checkout@v6`, `setup-uv@v8`).
+
 ## [0.1.0a5] — 2026-05-29
 
 A correctness fix plus internal memory/performance work. No public API

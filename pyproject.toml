@@ -1,6 +1,6 @@
 [project]
 name = "bellgrid"
-version = "0.1.0a5"
+version = "0.1.0a6"
 description = "GPU solver for stochastic dynamic programs: exact backward induction plus a model-based neural solver for high dimensions."
 readme = "README.md"
 requires-python = ">=3.11"
