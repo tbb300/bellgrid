@@ -123,6 +123,21 @@ class ActorCritic:
         ``n_quad`` (nested quadrature), fully parallel. See Feinberg et al. 2018,
         "Model-Based Value Expansion". Keep ``k`` small (2–3); deep rollouts blow
         up memory as ``n_quad^k``.
+    search_expansion : int | None
+        Rollout horizon used for the **candidate search** (the actor's argmax
+        target), decoupled from ``value_expansion`` which sets the horizon of the
+        **critic target**. Defaults to ``None`` ⇒ same as ``value_expansion``. The
+        expansion's cost is dominated by the search, which rolls every one of the
+        ``M`` candidates forward (``n_quad^{k-1}`` nested quadrature *per candidate*),
+        whereas the critic target rolls only the single on-policy action — so a
+        ``k``-step target is cheap but a ``k``-step search is ``~M×`` dearer. Setting
+        ``search_expansion=1`` keeps the low-bias ``k``-step *target* (which is what
+        compounds backward through the bootstrap, and the dominant source of the
+        value error) while running the search at the cheap one-step horizon: most of
+        the accuracy at close to baseline cost. The search loses only the
+        within-period sharpening of looking ``k`` exact steps ahead — and because the
+        critic it searches against is now low-bias, that loss is small. Use it to
+        make value expansion affordable at high dimension.
     activation : str
         ``"silu"`` (default), ``"tanh"``, ``"relu"``, or ``"gelu"``.
     state_samples : int
@@ -204,6 +219,7 @@ class ActorCritic:
     critic_quantiles: int = 1
     drop_top_atoms: int = 0
     value_expansion: int = 1
+    search_expansion: int | None = None
     activation: str = "silu"
     anneal_lr: bool = True
     log_every: int = 0
@@ -503,7 +519,8 @@ def _backward_sweep(setup: RLSetup, solver: ActorCritic, gen, sample_fn, phase: 
     M = 2 if solver.twin_critic else max(1, solver.n_critics)
     drop = 1 if solver.twin_critic else solver.drop_top_atoms
     Q = max(1, solver.critic_quantiles)
-    k = max(1, solver.value_expansion)
+    k = max(1, solver.value_expansion)               # critic-target rollout horizon
+    ks = k if solver.search_expansion is None else max(1, solver.search_expansion)
     taus = (torch.arange(Q, device=device, dtype=dtype) + 0.5) / Q
 
     actors_by_t: dict = {}
@@ -516,7 +533,15 @@ def _backward_sweep(setup: RLSetup, solver: ActorCritic, gen, sample_fn, phase: 
     # Backward sweep: the continuation is frozen at each step (terminal reward,
     # then the truncated-ensemble critics of the already-solved later periods).
     for t in reversed(horizon):
+        # Two continuations: the low-bias `k`-step rollout the CRITIC regresses onto
+        # (cheap — one on-policy action), and the `ks`-step rollout the candidate
+        # SEARCH uses (dear — every candidate). They coincide unless `search_expansion`
+        # decouples them (set it to 1 to keep the accurate target but a cheap search).
         value_next = _make_value_next(setup, t, k, actors_by_t, conts_by_t)
+        value_next_search = (
+            value_next if ks == k
+            else _make_value_next(setup, t, ks, actors_by_t, conts_by_t)
+        )
 
         actor = MLP(setup.n_feat, n_cont, solver.hidden, solver.activation).to(
             device=device, dtype=dtype
@@ -584,14 +609,17 @@ def _backward_sweep(setup: RLSetup, solver: ActorCritic, gen, sample_fn, phase: 
             state = sample_fn(t)
             bounds = setup.resolve_bounds(state)
             with torch.no_grad():
-                # Candidate 0 is the actor's own proposal; the rest are global +
-                # local perturbations. The actor improves toward the candidate-max
-                # action (argmax); the critic fits the on-policy value (handled in
-                # critic_loss), so V_θ matches forward simulation by construction.
+                # The actor regresses toward the best candidate the search finds (the
+                # critic fits the on-policy value separately, in critic_loss, so V_θ
+                # matches forward simulation). One-shot random-shooting argmax over
+                # proposal + global + local candidates, scored against the (possibly
+                # cheaper) `ks`-step continuation; the critic still regresses onto the
+                # low-bias `k`-step target.
                 cand = _candidate_actions(setup, actor, state, bounds, solver, gen)
                 state_b = {k_: v.unsqueeze(-1).expand_as(next(iter(cand.values())))
                            for k_, v in state.items()}
-                vals = _bellman_value(setup, state_b, cand, t, value_next, setup.discount)
+                vals = _bellman_value(setup, state_b, cand, t, value_next_search,
+                                      setup.discount)
                 best_idx = vals.max(dim=-1).indices               # [B]
                 a_target = {
                     k_: torch.gather(v, -1, best_idx.unsqueeze(-1)).squeeze(-1)

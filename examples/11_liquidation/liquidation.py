@@ -235,12 +235,17 @@ plt.show()
 #    it pulls the reported value from ~6% off (a single clipped-double-Q pair, the
 #    `twin_critic=True` special case) to ~1% of the policy's true return, robustly
 #    across seeds.
-#  - **Model-based value expansion** (`value_expansion=k`) — roll the *exact* model
-#    forward `k` steps before bootstrapping (unbiased here, since the model is the
-#    `Problem` itself), shrinking the bootstrap's share of the target. A composable
-#    knob that further sharpens the *policy* (we measured `k=2` cutting the
-#    optimality gap by a third); it is where unlimited compute buys still more
-#    accuracy, and is left off this run only to keep the solve to ~half an hour.
+#  - **Model-based value expansion** (`value_expansion=2, search_expansion=1`) — roll
+#    the *exact* model forward `k` steps before bootstrapping (unbiased here, since the
+#    model is the `Problem` itself), shrinking the bootstrap's share of the target. A
+#    diagnostic against the exact ruler showed the residual high-D gap is the *critic's*
+#    approximation error — not the candidate search, and not actor capacity — so leaning
+#    on the learned critic less is the lever. With it the value-consistency is a few
+#    tenths of a percent and the optimality gap ~2% (below). Going deeper (`k > 2`) only
+#    trades within single-seed noise (`k=2` and `k=3` both land at ~1.85–2.1%) while its
+#    nested quadrature costs `n_quad^{k-1}` in memory, so `k=2` is the sweet spot.
+#    `search_expansion=1` keeps the candidate search at the cheap one-step horizon, so
+#    only the single on-policy critic target pays the rollout.
 #  - (We also tried full distributional *quantile* critics; in this exact-quadrature
 #    setting they model shock variance — not the bias here — and did not help, so
 #    the atoms stay scalar. A useful negative result.)
@@ -257,7 +262,7 @@ t0 = time.time()
 polN, valN = solve(probN, solver=ActorCritic(
     n_quad=7, hidden=(128, 128), state_samples=2048, steps=250, lr=3e-3,
     n_global=8, n_local=16, inner_critic=2, n_critics=5, drop_top_atoms=2,
-    ergodic=True, seed=0))
+    value_expansion=2, search_expansion=1, ergodic=True, seed=0))
 print(f"N={N} neural solve: {time.time() - t0:.0f}s")
 
 # %%
@@ -333,6 +338,74 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
+# ## Trade-rate error is *not* value error
+#
+# The scatter above looks loose — but it plots *trades*, while the certification
+# measures *money*, and near the optimum the two are only weakly linked. Optimal
+# execution is linear-quadratic, so the value is **quadratic and flat in the
+# trade**: at the optimal rate $dV/dv = 0$, so a deviation $\Delta v$ costs only
+# $\tfrac12\,|Q_{vv}|\,\Delta v^2$ — *second order* (the envelope theorem). In this
+# problem's own numbers, at a representative state a **+50% error in the trade rate
+# forfeits ~0.5% of that state's value** (and a far smaller slice of the total
+# return — see below), and +25% forfeits ~0.05%. A point at
+# $(v^*{=}0.10,\ v_{nn}{=}0.15)$ that looks badly wrong is, in dollars, almost
+# exactly optimal — the policy is only ever "sloppy" where the objective is too
+# flat to care.
+#
+# Re-plotting the *same slack trades* as the exact value they forfeit (vs the
+# Riccati optimum, through the closed-form continuation) makes this concrete: the
+# cloud that sprawled across trade space collapses onto ~0 in value space. The
+# forfeit is symmetric and quadratic in the trade, so even the small systematic
+# over-trade tilt the policy shows is — like the scatter around it — a second-order
+# value effect: visible to the eye, nearly invisible to the P&L.
+
+# %%
+# The SAME slack trades, re-expressed as the value each forfeits vs the Riccati
+# optimum. Perturbing one asset's trade off its optimum (others held optimal) is a
+# 1-D slice of the quadratic Q*; the first-order term vanishes at the optimum, so
+# this is the pure second-order cost — exact, no Monte Carlo. Baselining at the
+# unconstrained Riccati `raw` (the value's global argmax) makes every forfeit ≥ 0.
+vstar_s, vnn_s, vloss_s = [], [], []
+for t in range(T):
+    st = {k: sim_nn[k][:, t] for k in sim_nn if k[0] in ("q", "P")}
+    Z = Z_of(st, N)                                              # [M, 2N] numpy (q | P)
+    q, P = Z[:, :N], Z[:, N:]
+    raw = Z @ KN[t].T                                            # unconstrained Riccati = optimum where interior
+    ann = np.stack([polN(st, t)[f"v{i}"].cpu().numpy() for i in range(N)], -1)
+    interior = (raw > 1e-3) & (raw < q - 1e-3)
+    S1 = SN[t + 1]
+    x = np.concatenate([q - raw, RHO * P], axis=1)             # optimal next-state mean [M, 2N]
+    Gq = (x @ S1)[:, :N]                                         # ∂(x'S1x)/∂q'
+    d = ann - raw
+    dr = (ann * P - ETA * ann**2) - (raw * P - ETA * raw**2)
+    dV = -(dr + BETA * (-2 * d * Gq + np.diag(S1[:N, :N]) * d**2))   # value forfeited (≥ 0)
+    vstar_s.append(raw[interior]); vnn_s.append(ann[interior]); vloss_s.append(dV[interior])
+vstar_s, vnn_s = np.concatenate(vstar_s), np.concatenate(vnn_s)
+vloss_pct = np.concatenate(vloss_s) / abs(Vric0) * 100          # % of total return
+
+rel = np.abs(vnn_s - vstar_s) / np.maximum(vstar_s, 1e-3)
+print(f"interior trades (n={vstar_s.size}): median trade-rate error {np.median(rel) * 100:.0f}% "
+      f"of v*  ->  median value forfeited {np.median(vloss_pct):.4f}% of the total return; "
+      f"95th-pct value forfeited {np.percentile(vloss_pct, 95):.4f}%")
+
+vmax = float(vstar_s.max()) * 1.05
+fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 5))
+axL.plot([0, vmax], [0, vmax], "k:", lw=1, label="exact match")
+axL.scatter(vstar_s, vnn_s, s=4, alpha=0.12, color="C0")
+axL.set(title="In trade space: looks loose", xlabel="Riccati trade $v^*$",
+        ylabel="neural trade", xlim=(-0.01, vmax), ylim=(-0.01, vmax))
+axL.legend(fontsize=8)
+axR.axhline(0, color="k", lw=0.8, ls=":")
+axR.scatter(vstar_s, vloss_pct, s=4, alpha=0.12, color="C2")
+axR.set(title="…in value: nearly free", xlabel="Riccati trade $v^*$",
+        ylabel="value forfeited (% of total return)")
+for a in (axL, axR):
+    a.grid(alpha=0.3)
+fig.suptitle("Trade-rate error is not value error — the objective is flat near the optimum")
+plt.tight_layout()
+plt.show()
+
+# %% [markdown]
 # ## Takeaway
 #
 # The linear-impact execution problem is an exact LQ, so its matrix-Riccati
@@ -340,7 +413,8 @@ plt.show()
 # / 80 state dimensions** — a regime no grid can touch — the neural solver behind
 # the same `Problem` spec passes all three checks: it reproduces the closed-form
 # optimal trade to ~0.01 per asset wherever the constraint is slack, its reported
-# value equals the policy's actual simulated return to ~1%, and that return sits
+# value equals the policy's actual simulated return to a fraction of a percent, and
+# that return sits
 # just below the unconstrained Riccati — the genuine price of the no-short /
 # can't-oversell constraint the solver honours and the closed form ignores. At one
 # asset it agrees with both the grid and the closed form too.
@@ -351,7 +425,9 @@ plt.show()
 # Bellman expectation is already exact. The fix is a **truncated critic ensemble**
 # (drop the most optimistic atoms) — the modern, finer-grained successor to TD3's
 # clipped double-Q — which turns the 80-D value from a seed-dependent ~6% blow-up
-# into a stable ~1% number. Model-based value expansion sharpens the policy further;
+# into a stable ~1% number. Model-based value expansion then leans on that critic less
+# still — a diagnostic pinned the residual high-D gap on critic approximation error,
+# not the candidate search — taking the value-consistency to ~0.1%;
 # distributional quantile critics, by contrast, buy nothing here (the bias is
 # cross-estimate optimism, not shock variance). Same `Problem`, three knobs.
 #

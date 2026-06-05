@@ -21,3 +21,7 @@ htmlcov/
 *.pt
 *.npz
 output/
+
+# local scratch / experiment artifacts
+scratch_*.py
+*.log
