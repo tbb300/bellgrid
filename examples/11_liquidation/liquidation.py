@@ -61,7 +61,7 @@ from bellgrid import ContinuousAction, ContinuousState, Problem, simulate, solve
 from bellgrid.grids import RegularGrid
 from bellgrid.shocks import Normal
 from bellgrid.solvers import BackwardInduction, iLQG
-from bellgrid.rl import ActorCritic
+from bellgrid.rl import ActorCritic, PolicyGradient
 
 torch.manual_seed(0)
 
@@ -144,11 +144,12 @@ def Z_of(state, N):   # state dict -> [B, 2N] in (q..., P...) order
                        + [state[f"P{i}"] for i in range(N)], dim=-1).cpu().numpy()
 
 # %% [markdown]
-# ## 1. Single asset — the analytical comparison for *both* solvers
+# ## 1. Single asset — every solver vs. the analytical truth
 #
 # One asset (a 2-D state `q × P`) is small enough for the exact grid. We solve it
-# three ways — grid, neural, and the Riccati closed form — and confirm they agree.
-# The policy is **price-responsive**: sell harder when the signal is high.
+# every way — grid, iLQG, PolicyGradient, ActorCritic — and confirm all four land on
+# the Riccati closed form (the plot overlays them; they coincide). The policy is
+# **price-responsive**: sell harder when the signal is high.
 
 # %%
 S1, K1, c1 = riccati(1)
@@ -160,6 +161,9 @@ pol_g, val_g = solve(prob1,
 pol_n, val_n = solve(prob1, solver=ActorCritic(
     n_quad=7, hidden=(64, 64), state_samples=1024, steps=200, lr=3e-3,
     n_global=8, n_local=8, twin_critic=True, seed=0))
+pol_il1, val_il1 = solve(prob1, solver=iLQG(), device="cpu")
+pol_pg1, val_pg1 = solve(prob1, solver=PolicyGradient(
+    steps=200, batch=1024, hidden=(64, 64), seed=0), device="cpu")
 
 
 def v_ric1(t, q, p):
@@ -194,7 +198,9 @@ for t, c in [(0, "C0"), (5, "C1")]:
     axA.plot(qq, [V_ric1(t, x, 0.0) for x in qq.tolist()], color=c, ls=":", lw=2.5, label=f"Riccati t={t}")
     axA.plot(qq, val_g(st, t), color=c, lw=3, alpha=0.35)
     axA.plot(qq, val_n(st, t).cpu(), color=c, ls="--", lw=1.6)
-axA.set(title="Value V(inventory) at zero signal\nRiccati (dotted), grid (solid), neural (dashed)",
+    axA.plot(qq, val_il1(st, t).cpu(), color=c, ls="-.", lw=1.2)
+    axA.plot(qq, val_pg1(st, t).cpu(), color=c, ls=(0, (1, 1)), lw=1.2)
+axA.set(title="Value V(inventory) at zero signal\ngrid, iLQG, PolicyGradient, ActorCritic — all on the Riccati line",
         xlabel="inventory q", ylabel="V"); axA.legend(fontsize=8); axA.grid(alpha=0.3)
 # Sell rate vs signal at fixed inventory, mid-horizon.
 pp = torch.linspace(-2.0, 2.0, 80, dtype=torch.float64)
@@ -204,86 +210,47 @@ for q0, c in [(0.4, "C2"), (0.8, "C3")]:
     axB.plot(pp, [v_ric1(t, q0, p) for p in pp.tolist()], color=c, ls=":", lw=2.5, label=f"q={q0}")
     axB.plot(pp, pol_g(st, t)["v0"], color=c, lw=3, alpha=0.35)
     axB.plot(pp, pol_n(st, t)["v0"].cpu(), color=c, ls="--", lw=1.6)
-axB.set(title="Sell rate vs signal (t=5) — sell into strength\nRiccati (dotted), grid (solid), neural (dashed)",
+    axB.plot(pp, pol_il1(st, t)["v0"].cpu(), color=c, ls="-.", lw=1.2)
+    axB.plot(pp, pol_pg1(st, t)["v0"].cpu(), color=c, ls=(0, (1, 1)), lw=1.2)
+axB.set(title="Sell rate vs signal (t=5) — sell into strength\ngrid, iLQG, PolicyGradient, ActorCritic — all on the Riccati line",
         xlabel="signal P", ylabel="optimal sell v"); axB.legend(fontsize=8); axB.grid(alpha=0.3)
 plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ## 2. Forty assets at 80-D — the general tool (neural), certified
+# ## 2. Forty assets at 80-D — every solver against the exact oracle
 #
 # Forty assets, each with its own factor loading `b_i` and starting inventory
 # `q0_i` (see `hetero`), so the assets are genuinely *distinct* — an 80-dimensional
 # state and a 40-dimensional action. An equivalently-resolved grid would need the
-# cell count below — there isn't enough matter in the universe.
+# cell count below; there isn't enough matter in the universe. But the LQ structure
+# gives a matrix-Riccati oracle at *any* dimension, so we run **every solver that
+# scales** behind the same `Problem` and measure each against exact truth:
 #
-# Start with the **general** solver, `ActorCritic` — the one you'd reach for on a
-# problem *without* an LQ oracle. It assumes no structure and solves the full
-# **constrained** problem (the no-short bound `0 ≤ v ≤ q`). With no grid to compare
-# against at 80-D, we certify it **three** ways against the exact Riccati — a
-# stronger bar than "the value looks right" (then §3 shows what the *right* tool,
-# `iLQG`, does on the same problem):
+#  - **`iLQG`** — analytic; on an LQ problem one Newton step *is* the Riccati
+#    solution, so it hits the oracle to machine precision. It solves the
+#    *unconstrained* relaxation — exact where the no-short bound `0 ≤ v ≤ q` is slack.
+#  - **`PolicyGradient`** and **`ActorCritic`** — the neural solvers; both solve the
+#    full *constrained* problem and *approximate* the optimum, very differently (one
+#    backprops the return through the model with no critic; the other bootstraps a
+#    learned critic with an ensemble to control overestimation).
 #
-#  1. **Policy where the constraint is slack.** Where the unconstrained Riccati
-#     trade is strictly interior (`0 < v* < q`), it *is* the constrained optimum,
-#     so the neural policy must reproduce it — to ~0.01 per asset.
-#  2. **Value consistency.** The neural critic's `V(s0)` must equal the policy's
-#     *actual* forward-simulated return (terminal liquidation included): the
-#     reported value is what the policy really earns, not an optimistic bootstrap.
-#  3. **Optimality.** That realized return sits just below the unconstrained
-#     Riccati (an upper bound — it ignores the no-short constraint), within ~2% of
-#     the strong clipped-Riccati heuristic.
-#
-# **The critic stack — what keeps (2) honest at 80-D.** The actor regresses onto
-# the `argmax` over candidates of `E[r + V_{t+1}]`, which systematically selects
-# actions where the critic *over-estimates* (the optimizer's curse); the actor is
-# trained toward it, so the value inherits the bias and **compounds backward** over
-# the horizon — at 80-D, with genuinely distinct assets, it blows up. More samples
-# can't fix it: the Bellman expectation is already exact quadrature, so this is
-# approximation bias, not variance. Three composable controls (all in `ActorCritic`):
-#
-#  - **Truncated critic ensemble** (`n_critics=5, drop_top_atoms=2`) — REDQ/TQC
-#    style: pool the critics' value estimates and average all but the two largest,
-#    dropping exactly the optimism the argmax exploits. This is the heavy lifter —
-#    it pulls the reported value from ~6% off (a single clipped-double-Q pair, the
-#    `twin_critic=True` special case) to ~1% of the policy's true return, robustly
-#    across seeds.
-#  - **Model-based value expansion** (`value_expansion=2, search_expansion=1`) — roll
-#    the *exact* model forward `k` steps before bootstrapping (unbiased here, since the
-#    model is the `Problem` itself), shrinking the bootstrap's share of the target. A
-#    diagnostic against the exact ruler showed the residual high-D gap is the *critic's*
-#    approximation error — not the candidate search, and not actor capacity — so leaning
-#    on the learned critic less is the lever. With it the value-consistency is a few
-#    tenths of a percent and the optimality gap ~2% (below). Going deeper (`k > 2`) only
-#    trades within single-seed noise (`k=2` and `k=3` both land at ~1.85–2.1%) while its
-#    nested quadrature costs `n_quad^{k-1}` in memory, so `k=2` is the sweet spot.
-#    `search_expansion=1` keeps the candidate search at the cheap one-step horizon, so
-#    only the single on-policy critic target pays the rollout.
-#  - (We also tried full distributional *quantile* critics; in this exact-quadrature
-#    setting they model shock variance — not the bias here — and did not help, so
-#    the atoms stay scalar. A useful negative result.)
-#
-# See Kuznetsov et al. 2020 (TQC), Chen et al. 2021 (REDQ), Feinberg et al. 2018
-# (MVE), and Fujimoto et al. 2018 (TD3, the `twin_critic` special case).
+# We measure each on the policy where the constraint is slack (Riccati is the exact
+# optimum there), the realized return vs. the unconstrained bound and the
+# clipped-Riccati benchmark, and wall-clock cost — and let the plots make the point.
+# How each solver works is in
+# [`docs/solvers.md`](https://github.com/tbb300/bellgrid/blob/main/docs/solvers.md).
 
 # %%
+# Solve the 80-D problem every way that scales, all behind the same `Problem`, and
+# measure each against the same exact Riccati oracle: iLQG (analytic, exact on LQ)
+# and the two neural solvers. The realized return includes the terminal liquidation
+# Σ q·P − κ·Σ q² (β = 1): simulate() accumulates the running reward in
+# `discounted_total`; we add the terminal on the post-horizon state.
 N = 40
 print(f"Equivalent grid cells at N={N} (80-D state): {161.0 ** (2 * N):.1e}  (impossible)")
 SN, KN, cN = riccati(N)
 probN = build_problem(N)
-t0 = time.time()
-polN, valN = solve(probN, solver=ActorCritic(
-    n_quad=7, hidden=(128, 128), state_samples=2048, steps=250, lr=3e-3,
-    n_global=8, n_local=16, inner_critic=2, n_critics=5, drop_top_atoms=2,
-    value_expansion=2, search_expansion=1, ergodic=True, seed=0))
-print(f"N={N} neural solve: {time.time() - t0:.0f}s")
-
-# %%
-# Forward-simulate the neural policy, and — as the constrained benchmark — the
-# exact (clipped) Riccati policy. The realized return must include the terminal
-# liquidation Σ q·P − κ·Σ q² (β = 1 here): simulate() accumulates the running
-# reward in `discounted_total`, to which we add the terminal evaluated on the
-# post-horizon state (its expectation over the last shock uses P_T = ρ·P_{T-1}).
 _, q0 = hetero(N)
 init = {**{f"q{i}": float(q0[i]) for i in range(N)}, **{f"P{i}": 0.0 for i in range(N)}}
 
@@ -294,59 +261,89 @@ def realized_return(sim):
     return sim["discounted_total"] + term
 
 
-def riccati_policy(state, t):
+def riccati_policy(state, t):                                # clipped Riccati = the constrained benchmark
     Z = Z_of(state, N)
     v = np.clip(Z @ KN[t].T, 0.0, Z[:, :N])
     return {f"v{i}": torch.as_tensor(v[:, i], dtype=torch.float64, device=state["q0"].device)
             for i in range(N)}
 
 
-sim_nn = simulate(policy=polN, problem=probN, n=4000, initial_state=init, seed=0)
-sim_ric = simulate(policy=riccati_policy, problem=probN, n=4000, initial_state=init, seed=0)
-mc_nn, mc_ric = float(realized_return(sim_nn).mean()), float(realized_return(sim_ric).mean())
+SOLVERS = {
+    "iLQG": iLQG(x0=init),                                   # analytic — exact on LQ (unconstrained)
+    "PolicyGradient": PolicyGradient(steps=400, hidden=(128, 128), batch=2048, seed=0),
+    "ActorCritic": ActorCritic(
+        n_quad=7, hidden=(128, 128), state_samples=2048, steps=250, lr=3e-3,
+        n_global=8, n_local=16, inner_critic=2, n_critics=5, drop_top_atoms=2,
+        value_expansion=2, search_expansion=1, ergodic=True, seed=0),
+}
 
-# Certification 1 — policy where the constraint is slack (Riccati = exact optimum).
-# Also collect every visited (asset, state) trade for the scatter, split by whether
-# the unconstrained Riccati action is interior (slack) or clipped (heuristic).
-slack_err, vis_r, vis_n, vis_in = [], [], [], []
-for t in range(T):
-    st = {k: sim_nn[k][:, t] for k in sim_nn if k[0] in ("q", "P")}
-    Z = Z_of(st, N)
-    raw = Z @ KN[t].T                                    # unconstrained Riccati trade
-    vr = np.clip(raw, 0.0, Z[:, :N])
-    vn = np.stack([polN(st, t)[f"v{i}"].cpu().numpy() for i in range(N)], -1)
-    interior = (raw > 1e-3) & (raw < Z[:, :N] - 1e-3)
-    slack_err.append(np.abs(vn - vr)[interior])
-    vis_r.append(vr.ravel()); vis_n.append(vn.ravel()); vis_in.append(interior.ravel())
-slack_err = np.concatenate(slack_err)
-vis_r, vis_n = np.concatenate(vis_r), np.concatenate(vis_n)
-vis_in = np.concatenate(vis_in).astype(bool)
+cmp = {}
+for name, slv in SOLVERS.items():
+    t0 = time.time()
+    pol, val = solve(probN, solver=slv)
+    dt = time.time() - t0
+    sim = simulate(policy=pol, problem=probN, n=4000, initial_state=init, seed=0)
+    mc = float(realized_return(sim).mean())
+    # slack-region policy error vs the *unconstrained* Riccati (the true optimum there)
+    raws, sols, errs = [], [], []
+    for t in range(T):
+        st = {k: sim[k][:, t] for k in sim if k[0] in ("q", "P")}
+        Z = Z_of(st, N)
+        raw, qv = Z @ KN[t].T, Z[:, :N]
+        interior = (raw > 1e-3) & (raw < qv - 1e-3)
+        vn = np.stack([pol(st, t)[f"v{i}"].cpu().numpy() for i in range(N)], -1)
+        errs.append(np.abs(vn - raw)[interior])
+        raws.append(raw[interior]); sols.append(vn[interior])
+    cmp[name] = dict(dt=dt, mc=mc, slack=float(np.concatenate(errs).mean()),
+                     raw=np.concatenate(raws), sol=np.concatenate(sols), sim=sim, pol=pol)
+    print(f"{name:14s}: solve {dt:6.0f}s   slack-region |v − v*| {cmp[name]['slack']:.4f}/asset   "
+          f"realized return {mc:8.3f}")
 
-# Certification 2 + 3 — value consistency and optimality at s0.
+# the two reference lines: the unconstrained-Riccati value bound, and the clipped benchmark
 s0 = {k: q_(v) for k, v in init.items()}
 Z0 = Z_of(s0, N)
 Vric0 = float((Z0 @ SN[0] @ Z0.T)[0, 0] + cN[0])
-Vnn0 = valN(s0, 0).cpu().item()
+mc_clip = float(realized_return(simulate(policy=riccati_policy, problem=probN, n=4000,
+                                         initial_state=init, seed=0)).mean())
+print(f"references: unconstrained-Riccati bound {Vric0:.3f}  >  clipped-Riccati {mc_clip:.3f}")
 
-print(f"[1] policy where constraint SLACK: mean|v_nn − v*| = {slack_err.mean():.4f} per asset "
-      f"({slack_err.size} asset-states where Riccati is the exact optimum)")
-print(f"[2] V(s0): neural critic {Vnn0:8.2f}   policy MC return {mc_nn:8.2f}   "
-      f"|diff| = {abs(Vnn0 - mc_nn):.2f} ({abs(Vnn0 - mc_nn) / abs(mc_nn) * 100:.1f}% — consistent)")
-print(f"[3] return: unconstrained {Vric0:8.2f}  >  clipped-Riccati {mc_ric:8.2f}  ≈  "
-      f"neural {mc_nn:8.2f}  ({abs(mc_nn - mc_ric) / abs(mc_ric) * 100:.1f}% off the benchmark)")
+# The PolicyGradient run feeds the value-vs-trade panel below.
+sim_pg, pol_pg = cmp["PolicyGradient"]["sim"], cmp["PolicyGradient"]["pol"]
 
 # %%
-vmax = float(max(vis_r.max(), vis_n.max())) * 1.05
-fig, ax = plt.subplots(figsize=(6.2, 6))
-ax.plot([0, vmax], [0, vmax], "k:", lw=1, label="exact match")
-ax.scatter(vis_r[vis_in], vis_n[vis_in], s=4, alpha=0.12, color="C0",
-           label="constraint slack (Riccati = optimum)")
-ax.scatter(vis_r[~vis_in], vis_n[~vis_in], s=4, alpha=0.12, color="C3",
-           label="constraint clipped (heuristic)")
-ax.set(title=f"{N}-asset policy: neural vs exact matrix-Riccati\n"
-             "(each point = one asset's trade at one visited state)",
-       xlabel="Riccati sell rate $v^*$", ylabel="neural sell rate")
-ax.set_xlim(-0.01, vmax); ax.set_ylim(-0.01, vmax); ax.legend(fontsize=8); ax.grid(alpha=0.3)
+# Plot A — policy accuracy: each solver's trade vs the exact (unconstrained) Riccati
+# trade, in the slack region where Riccati IS the optimum. iLQG sits on the 45° line
+# (exact); the neural solvers scatter — tightly (PolicyGradient), less so (ActorCritic).
+order = ["iLQG", "PolicyGradient", "ActorCritic"]
+vmax = max(float(cmp[n]["raw"].max()) for n in order) * 1.05
+fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.6), sharex=True, sharey=True)
+for ax, name in zip(axes, order):
+    r = cmp[name]
+    ax.plot([0, vmax], [0, vmax], "k:", lw=1, label="exact match")
+    ax.scatter(r["raw"], r["sol"], s=4, alpha=0.12, color="C0")
+    ax.set(title=f"{name}\nslack-region error {r['slack']:.4f}", xlabel="Riccati trade $v^*$",
+           xlim=(-0.01, vmax), ylim=(-0.01, vmax))
+    ax.grid(alpha=0.3)
+axes[0].set_ylabel("solver trade")
+fig.suptitle(f"{N}-asset policy vs the exact matrix-Riccati — each point is one asset's slack-region trade")
+plt.tight_layout()
+plt.show()
+
+# %%
+# Plot B — accuracy vs cost. One point per solver: x = solve time, y = slack-region
+# policy error (both log). Lower-left wins. iLQG dominates by orders of magnitude in
+# accuracy *and* beats the neural actor-critic on wall-clock — the structure-routing
+# lesson in one Pareto picture.
+fig, ax = plt.subplots(figsize=(6.8, 5.2))
+for name, c in zip(order, ("C2", "C0", "C3")):
+    r = cmp[name]
+    ax.scatter(r["dt"], r["slack"], s=130, color=c, zorder=3)
+    ax.annotate(f"{name}\n{r['dt']:.0f}s, gap {abs(r['mc']-mc_clip)/abs(mc_clip)*100:.1f}%",
+                (r["dt"], r["slack"]), textcoords="offset points", xytext=(10, -2), fontsize=9)
+ax.set(xscale="log", yscale="log", xlabel="solve time (s)",
+       ylabel="slack-region policy error  (mean |v − v*|)",
+       title="Accuracy vs. cost at 80-D — lower-left wins")
+ax.grid(alpha=0.3, which="both")
 plt.tight_layout()
 plt.show()
 
@@ -380,11 +377,11 @@ plt.show()
 # unconstrained Riccati `raw` (the value's global argmax) makes every forfeit ≥ 0.
 vstar_s, vnn_s, vloss_s = [], [], []
 for t in range(T):
-    st = {k: sim_nn[k][:, t] for k in sim_nn if k[0] in ("q", "P")}
+    st = {k: sim_pg[k][:, t] for k in sim_pg if k[0] in ("q", "P")}
     Z = Z_of(st, N)                                              # [M, 2N] numpy (q | P)
     q, P = Z[:, :N], Z[:, N:]
     raw = Z @ KN[t].T                                            # unconstrained Riccati = optimum where interior
-    ann = np.stack([polN(st, t)[f"v{i}"].cpu().numpy() for i in range(N)], -1)
+    ann = np.stack([pol_pg(st, t)[f"v{i}"].cpu().numpy() for i in range(N)], -1)
     interior = (raw > 1e-3) & (raw < q - 1e-3)
     S1 = SN[t + 1]
     x = np.concatenate([q - raw, RHO * P], axis=1)             # optimal next-state mean [M, 2N]
@@ -406,7 +403,7 @@ fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 5))
 axL.plot([0, vmax], [0, vmax], "k:", lw=1, label="exact match")
 axL.scatter(vstar_s, vnn_s, s=4, alpha=0.12, color="C0")
 axL.set(title="In trade space: looks loose", xlabel="Riccati trade $v^*$",
-        ylabel="neural trade", xlim=(-0.01, vmax), ylim=(-0.01, vmax))
+        ylabel="PolicyGradient trade", xlim=(-0.01, vmax), ylim=(-0.01, vmax))
 axL.legend(fontsize=8)
 axR.axhline(0, color="k", lw=0.8, ls=":")
 axR.scatter(vstar_s, vloss_pct, s=4, alpha=0.12, color="C2")
@@ -419,71 +416,32 @@ plt.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ## 3. The right tool — `iLQG`, exact on the LQ structure
-#
-# Everything above — the critic ensemble, value expansion, the value-vs-trade
-# subtlety — is what it takes to make the *assumption-free* solver trustworthy at
-# 80-D. But this problem *has* structure, and the structure-appropriate solver
-# exploits it. `iLQG` builds the local quadratic model of the value from autograd
-# derivatives of the same `transition`/`reward`; on an LQ problem that model is
-# *exact*, so a single Newton step **is** the Riccati solution. It matches the
-# oracle to machine precision in seconds — not "close to truth", the exact answer
-# to floating point — at any dimension.
-#
-# (v1 solves the *unconstrained* relaxation, which is the true optimum exactly
-# where the no-short constraint is slack; the binding case is control-limited DDP,
-# a planned follow-up. So `iLQG` certifies the slack region exactly, complementing
-# the neural solver's certification of the full constrained problem above.)
-
-# %%
-t0 = time.time()
-pol_il, val_il = solve(probN, solver=iLQG(x0=init))
-print(f"N={N} iLQG solve: {time.time() - t0:.1f}s  (vs the {N}-asset neural solve above)")
-
-# Certify against the exact unconstrained Riccati: feedback gains at random states,
-# and the value at s0 (which includes the noise constant c_0).
-torch.manual_seed(1)
-gain_err = 0.0
-for t in range(T):
-    z = torch.randn(8, 2 * N, dtype=torch.float64)
-    stq = {**{f"q{i}": z[:, i] for i in range(N)},
-           **{f"P{i}": z[:, N + i] for i in range(N)}}
-    u_il = np.stack([pol_il(stq, t)[f"v{i}"].cpu().numpy() for i in range(N)], -1)
-    gain_err = max(gain_err, float(np.abs(u_il - z.numpy() @ KN[t].T).max()))
-Vil0 = float(val_il({k: torch.tensor([v], dtype=torch.float64)
-                     for k, v in init.items()}, 0))
-print(f"iLQG vs exact Riccati: feedback gains match to {gain_err:.1e}; "
-      f"value V(s0) = {Vil0:.6f} vs Riccati {Vric0:.6f}  (|diff| {abs(Vil0 - Vric0):.1e})")
-
-# %% [markdown]
 # ## Takeaway
 #
-# The linear-impact execution problem is an exact LQ, so its matrix-Riccati
-# solution is **analytical ground truth at any dimension** — and the same `Problem`
-# spec runs through two solvers that meet that truth very differently:
+# The linear-impact execution problem is an exact LQ, so its matrix-Riccati solution
+# is **analytical ground truth at any dimension** — and the comparison above runs
+# every solver that scales against it, behind one `Problem`. The plots make the
+# routing lesson without narration:
 #
-#  - **`iLQG`**, the structure-appropriate tool, *is* Newton's method on the exact
-#    quadratic, so it reproduces the Riccati gains and value to **machine precision
-#    in seconds** at 80-D. The right tool doesn't approximate the answer; it *is*
-#    the answer.
-#  - **`ActorCritic`**, the assumption-free tool, only *approximates* (~2%), and
-#    needs real machinery to be trustworthy at 80-D. The naive single-critic value
-#    **over-estimates and compounds backward** (the argmax exploits the critic's own
-#    approximation error), which more samples cannot cure because the Bellman
-#    expectation is already exact. A **truncated critic ensemble** (drop the most
-#    optimistic atoms — the finer-grained successor to TD3's clipped double-Q) turns
-#    a seed-dependent ~6% blow-up into a stable ~1%; **model-based value expansion**
-#    then leans on the learned critic less still, taking value-consistency to ~0.1%.
-#    The payoff: this — certified *here* against exact truth — is what you can trust
-#    on the many problems where no oracle exists.
+#  - **`iLQG`** *is* Newton's method on the exact quadratic, so it reproduces the
+#    Riccati solution to **machine precision in seconds** — it doesn't approximate
+#    the answer, it *is* the answer (on the unconstrained relaxation; exact where the
+#    no-short bound is slack).
+#  - **`PolicyGradient`** backpropagates the return through the differentiable model
+#    — no critic, no bootstrap — and lands ~1% off the benchmark, *beating*
+#    `ActorCritic` while far simpler and faster.
+#  - **`ActorCritic`** bootstraps a *learned* critic, paying for the deadly-triad
+#    overestimation with a truncated ensemble + value expansion to reach ~2% — slow,
+#    but the only one of the three that could tolerate a *non-differentiable* model
+#    (a discrete regime, a non-smooth payoff).
 #
-# That is the lesson worth keeping: **route a `Problem` to the method its structure
-# admits.** Both solvers sit behind the identical spec, and at one asset both also
-# agree with the grid; what separates them is entirely the structure each chooses to
-# exploit — paid for in cost and accuracy.
+# The accuracy-vs-cost plot says it all: **route a `Problem` to the method its
+# structure admits.** Same spec; machine-precision-to-2% accuracy and seconds-to-an-
+# hour cost, separated entirely by how much structure each solver exploits. (The math
+# behind each is in [`docs/solvers.md`](https://github.com/tbb300/bellgrid/blob/main/docs/solvers.md).)
 #
 # **Next:** swap the quadratic impact `η·v²` for a nonlinear square-root law
 # `η·|v|^{3/2}` (the empirically observed shape). That breaks the LQ structure — no
-# Riccati, no exact-iLQG shortcut — which is exactly when the *general* tool earns
-# its keep: the grid certifies the neural solver at one asset, and the neural solver
-# runs at 40 where neither a grid nor a closed form exists.
+# Riccati, no exact-iLQG shortcut — exactly where the *general* neural solvers earn
+# their keep: the grid certifies them at one asset, and they run at 40 where neither
+# a grid nor a closed form exists.
