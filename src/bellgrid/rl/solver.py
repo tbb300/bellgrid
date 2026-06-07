@@ -915,6 +915,13 @@ def _actor_critic(problem, solver: ActorCritic, *, device, dtype: torch.dtype):
     if setup.disc_actions:
         # Discrete actions: fitted value iteration (no actor; policy = argmax_a Q over
         # the enumerated action grid).
+        if solver.ergodic and solver.init_state is not None:
+            missing = [n for n in setup.state_names if n not in solver.init_state]
+            if missing:
+                raise ValueError(
+                    f"ActorCritic.init_state is missing a start value for state(s) "
+                    f"{missing}; it must name every state ({setup.state_names})"
+                )
         uniform_fn = lambda t: setup.sample_states(solver.state_samples, gen)  # noqa: E731
         if solver.log_every:
             print("[sweep: uniform (discrete actions)]", flush=True)

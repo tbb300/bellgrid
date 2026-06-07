@@ -18,6 +18,8 @@ action spaces, and the infinite-horizon (stationary) case raise
 """
 
 import inspect
+import math
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -180,6 +182,17 @@ def build_setup(problem: Problem, n_quad: int, *, device, dtype) -> RLSetup:
             "ActorCritic v1 takes either all-continuous or all-discrete actions, not "
             "a mix; use the grid solver for a mixed action space"
         )
+    if disc_actions:
+        n_combos = math.prod(a.n for a in disc_actions)
+        if n_combos > 1024:
+            warnings.warn(
+                f"ActorCritic enumerates all {n_combos} discrete-action combinations "
+                f"(∏ nᵢ) at every sampled state; this is exponential in the number of "
+                f"discrete actions and can be slow/memory-heavy. The discrete path "
+                f"targets low-cardinality control — consider the grid solver for a "
+                f"large action space.",
+                stacklevel=2,
+            )
 
     cont_states = [s for s in problem.states if isinstance(s, ContinuousState)]
     disc_states = [s for s in problem.states if isinstance(s, DiscreteState)]
