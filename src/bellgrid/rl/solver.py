@@ -209,6 +209,14 @@ class ActorCritic:
         visited-state buffer.
     seed : int | None
         Seed for sampling and net initialisation.
+    init_state : dict | None
+        Initial-state distribution for the *discrete-action* ergodic refinement
+        (``{state_name: scalar | tensor}``). When set, the ergodic passes roll the
+        policy forward from this start instead of from uniform initial states — the
+        right training distribution when the dynamics concentrate the reachable set
+        far from a uniform box (e.g. an asset price started at ``S0``, where the
+        forward paths occupy a thin shell a uniform box would mostly miss). Ignored
+        by the continuous-action path (which always uses uniform initial states).
     """
 
     n_quad: int = 7
@@ -237,6 +245,7 @@ class ActorCritic:
     ergodic_mix: float = 0.25
     ergodic_sim_paths: int = 4096
     seed: int | None = None
+    init_state: dict | None = None
 
 
 def _bellman_integrand(setup: RLSetup, state: dict, action: dict, t, value_next, discount):
@@ -455,6 +464,56 @@ def _collect_visited(setup: RLSetup, actors_by_t: dict, n_paths: int, gen) -> di
         nxt = setup.problem.transition(state, action, shock, t)
         new_state = {}
         for s in setup.cont_states:                 # clamp into range → valid inputs
+            low, high = setup._cont_meta[s.name][0:2]
+            new_state[s.name] = torch.clamp(
+                torch.as_tensor(nxt[s.name], dtype=setup.dtype, device=setup.device),
+                min=low, max=high,
+            )
+        for s in setup.disc_states:
+            new_state[s.name] = torch.as_tensor(
+                nxt[s.name], dtype=torch.long, device=setup.device
+            )
+        state = new_state
+    return visited
+
+
+def _collect_visited_discrete(setup: RLSetup, policy, init_state: dict,
+                              n_paths: int, gen) -> dict:
+    """Roll the *discrete* argmax policy forward from ``init_state`` (broadcast to
+    ``n_paths``); return the states visited at each period, ``{t: {name: [n_paths]}}``.
+
+    Unlike the continuous ``_collect_visited`` (uniform initial states), this starts
+    from a *point* (or given) initial distribution, because the reachable set of a
+    concentrating process — an asset price from ``S0``, say — is a thin shell that a
+    uniform box would not target. The visited continuous states are clamped into
+    range so they are valid net inputs."""
+    horizon = list(setup.problem.horizon)
+    cont_names = {s.name for s in setup.cont_states}
+    state = {}
+    for nm in setup.state_names:
+        v = init_state[nm]
+        if isinstance(v, torch.Tensor) and v.numel() == n_paths:
+            t = v.clone()
+        else:
+            dt = setup.dtype if nm in cont_names else torch.long
+            fill = float(v) if nm in cont_names else int(v)
+            t = torch.full((n_paths,), fill, dtype=dt, device=setup.device)
+        state[nm] = t
+
+    visited: dict = {}
+    for t in horizon:
+        visited[t] = {k: v.clone() for k, v in state.items()}
+        action = policy(state, t)
+        shock = {}
+        for s in setup.problem.shocks:
+            sm = s.sample(n_paths, generator=gen, dtype=setup.dtype, device=setup.device)
+            if isinstance(sm, dict):
+                shock.update(sm)
+            else:
+                shock[s.name] = sm
+        nxt = setup.problem.transition(state, action, shock, t)
+        new_state = {}
+        for s in setup.cont_states:
             low, high = setup._cont_meta[s.name][0:2]
             new_state[s.name] = torch.clamp(
                 torch.as_tensor(nxt[s.name], dtype=setup.dtype, device=setup.device),
@@ -855,16 +914,31 @@ def _actor_critic(problem, solver: ActorCritic, *, device, dtype: torch.dtype):
 
     if setup.disc_actions:
         # Discrete actions: fitted value iteration (no actor; policy = argmax_a Q over
-        # the enumerated action grid). Uniform-sampled states; ergodic refinement is a
-        # continuous-only path for now.
+        # the enumerated action grid).
         uniform_fn = lambda t: setup.sample_states(solver.state_samples, gen)  # noqa: E731
         if solver.log_every:
             print("[sweep: uniform (discrete actions)]", flush=True)
         conts, residual, action_grid = _backward_sweep_discrete(
             setup, solver, gen, uniform_fn, phase="uniform")
+        policy = _DiscretePolicy(setup, conts, action_grid)
+        # Ergodic refinement from a given start: re-train on the realised forward
+        # distribution rather than a uniform box (essential when the reachable set is
+        # a thin shell — see ActorCritic.init_state). Needs init_state; without it the
+        # uniform sweep stands (uniform-initial rollout would not concentrate).
+        if solver.ergodic and solver.init_state is not None:
+            for p in range(solver.ergodic_passes):
+                if solver.log_every:
+                    print(f"[sweep: ergodic {p + 1}/{solver.ergodic_passes} "
+                          f"(discrete actions)]", flush=True)
+                visited = _collect_visited_discrete(
+                    setup, policy, solver.init_state, solver.ergodic_sim_paths, gen)
+                sampler = _ergodic_sampler(setup, visited, solver, gen)
+                conts, residual, action_grid = _backward_sweep_discrete(
+                    setup, solver, gen, sampler, phase=f"ergodic{p + 1}")
+                policy = _DiscretePolicy(setup, conts, action_grid)
         value = _NeuralValue(setup, conts)
         value.residual_by_t = residual
-        return _DiscretePolicy(setup, conts, action_grid), value
+        return policy, value
 
     # Pass 1: uniform state sampling over the box.
     if solver.log_every:

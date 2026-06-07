@@ -210,6 +210,50 @@ def test_discrete_action_matches_grid():
         assert match >= 0.85, f"t={t} policy match {match:.1%}"
 
 
+def test_discrete_action_ergodic_runs():
+    """The discrete-action ergodic path (path sampling from `init_state`) should run
+    end-to-end and price the start near the grid oracle — exercises
+    `_collect_visited_discrete` and the ergodic refinement branch."""
+    torch.manual_seed(0)
+    beta, mu_d, sigma_d, maxq = 0.97, 3.0, 1.0, 4
+
+    def demand(shock):
+        return torch.clamp(mu_d + sigma_d * shock["z"], min=0.0)
+
+    def transition(state, action, shock, _t):
+        q = action["order"].to(state["inv"].dtype)
+        return {"inv": torch.clamp(state["inv"] + q - demand(shock), min=0.0)}
+
+    def reward(state, action, shock, _t):
+        q = action["order"].to(state["inv"].dtype)
+        d = demand(shock)
+        avail = state["inv"] + q
+        return (2.0 * torch.minimum(avail, d) - 0.1 * torch.clamp(avail - d, min=0.0)
+                - torch.clamp(d - avail, min=0.0) - 0.5 * q)
+
+    problem = Problem(
+        states=[ContinuousState("inv", range=(0.0, 20.0))],
+        actions=[DiscreteAction("order", n=maxq + 1)],
+        transition=transition, reward=reward, shocks=[Normal("z", sigma=1.0)],
+        horizon=range(0, 3), discount=beta,
+    )
+    pol_g, val_g = solve(
+        problem, state_grid={"inv": RegularGrid(n=300)}, action_grid={},
+        solver=BackwardInduction(n_quad=9), device="cpu",
+    )
+    pol_a, val_a = solve(
+        problem,
+        solver=ActorCritic(n_quad=9, twin_critic=True, steps=150, state_samples=1536,
+                           hidden=(128, 128), seed=0, ergodic=True,
+                           init_state={"inv": 8.0}, ergodic_passes=1,
+                           ergodic_sim_paths=1024),
+        device="cpu",
+    )
+    st = {"inv": torch.tensor([8.0])}
+    vg, va = float(val_g(st, 0)), float(val_a(st, 0))
+    assert abs(vg - va) / abs(vg) < 0.06, f"ergodic value at start: grid {vg:.3f} vs AC {va:.3f}"
+
+
 def test_grid_solver_still_requires_grids():
     """The solve() signature change keeps grids optional, but grid solvers must
     still be given both."""
