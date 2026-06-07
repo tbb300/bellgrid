@@ -103,7 +103,7 @@ The grid is exact, but its cost is `∏ (points per dimension)` — hopeless pas
 
 - **`iLQG`** — *smooth continuous control.* Builds the local quadratic model of the value from autograd derivatives of your `transition`/`reward` and solves it Newton-style. On a linear-quadratic problem that model is exact, so one step *is* the matrix-Riccati solution — to **machine precision, in seconds, at any dimension**. Returns a time-varying affine feedback law (globally optimal for LQ; local around the optimized trajectory otherwise).
 - **`PolicyGradient`** — *high-D continuous, the clean default.* Trains a policy by backpropagating the return straight through your differentiable model (the pathwise / "stochastic value gradient" estimator — *not* score-function/REINFORCE). **No learned critic, no bootstrap**, so none of the overestimation pathologies of value-based RL: the model itself supplies the policy gradient.
-- **`ActorCritic`** — *high-D with discrete states or non-differentiable dynamics.* The one option that tolerates a regime you can't differentiate through: it learns `V` as networks and **bootstraps** (sampling next states rather than differentiating them), with a truncated critic ensemble to control the resulting overestimation, trained on-distribution.
+- **`ActorCritic`** — *high-D with discrete states/actions or non-differentiable dynamics.* The one option that tolerates a regime you can't differentiate through — including a **discrete action**, which it handles by enumerating the action grid and doing fitted value iteration (optimal stopping, discrete control). It learns `V` as networks and **bootstraps** (sampling next states rather than differentiating them), with a truncated critic ensemble to control the resulting overestimation, trained on-distribution.
 
 ```python
 from bellgrid.solvers import iLQG
@@ -116,7 +116,7 @@ All four are **model-based** — they use your known, differentiable `transition
 
 **The correctness contract.** Because every solver shares the `Problem` spec, they certify each other — and where the problem is linear-quadratic, a matrix-Riccati closed form is an exact oracle at *any* dimension. [`11_liquidation`](https://github.com/tbb300/bellgrid/blob/main/examples/11_liquidation/liquidation.ipynb) certifies `iLQG` against it to **machine precision** and the neural solvers to ~1–2% at **80 state dimensions** (~10¹⁷⁶ equivalent grid cells). Where no oracle exists ([`10_hydropower`](https://github.com/tbb300/bellgrid/blob/main/examples/10_hydropower/hydropower.ipynb)), the grid certifies the high-D solvers on the low-D overlap and `simulate()` checks forward-consistency at scale. Prove it where you can; trust it where you must.
 
-Scope (v1): `iLQG` and `PolicyGradient` need an all-`ContinuousState`, `ContinuousAction`, scalar-discount, finite-horizon problem (the model must be differentiable). `ActorCritic` additionally handles `DiscreteState`. `MarkovChain`, `DiscreteAction`, callable discount, and infinite horizon use the grid solvers.
+Scope (v1): `iLQG` and `PolicyGradient` need an all-`ContinuousState`, `ContinuousAction`, scalar-discount, finite-horizon problem (the model must be differentiable). `ActorCritic` additionally handles `DiscreteState` and all-`DiscreteAction` problems. `MarkovChain`, *mixed* continuous+discrete action spaces, callable discount, and infinite horizon use the grid solvers.
 
 ## Examples
 
@@ -135,6 +135,7 @@ Eleven canonical problems, each side-by-side with an analytical or numerical ref
 | [`09_lifecycle_planning`](https://github.com/tbb300/bellgrid/blob/main/examples/09_lifecycle_planning/lifecycle_planning.ipynb) | Full lifecycle: consumption + retirement + asset allocation under mortality, regime-switching markets, warm-glow bequest | The motivating problem. Exercises every primitive at once. |
 | [`10_hydropower`](https://github.com/tbb300/bellgrid/blob/main/examples/10_hydropower/hydropower.ipynb) | Multi-reservoir hydropower under a stochastic OU price — **the neural-solver showcase** (`ActorCritic`) | Exact grid at N=1; forward-simulation consistency (~1%) at 5-D / 5-year, where no grid exists |
 | [`11_liquidation`](https://github.com/tbb300/bellgrid/blob/main/examples/11_liquidation/liquidation.ipynb) | Optimal execution of N correlated assets (Almgren–Chriss) — **every solver, head-to-head against an exact high-D oracle** | Matrix-Riccati closed form at any dimension. At **N=40 (80-D, ~1e176 grid cells)** `iLQG` matches it to **machine precision in 26 s**, `PolicyGradient` to ~1% in 62 s, `ActorCritic` to ~2% in 55 min — an accuracy-vs-cost Pareto that *is* the structure-routing lesson. |
+| [`12_bermudan_basket`](https://github.com/tbb300/bellgrid/blob/main/examples/12_bermudan_basket/bermudan_basket.ipynb) | Bermudan max-call basket — **a discrete (exercise) decision over a high-D price state** (optimal stopping, `ActorCritic`) | Exact grid oracle at d=1 (value + exercise boundary match); at **d=5** (grid hopeless) the learned policy is within **~2%** of Longstaff–Schwartz and the published benchmark, checked by independent Monte Carlo. |
 
 ## What's built
 
@@ -153,12 +154,12 @@ Every solver consumes the same `Problem` and returns the same `(policy, value)` 
 
 | solver | reach for it when… | states | actions | the answer it gives |
 |---|---|---|---|---|
-| **grid** — `BackwardInduction` / `PolicyIteration` | ≤ ~6 dimensions, **or any discrete action**, or infinite horizon | continuous + discrete + Markov | continuous + **discrete** | **exact** across the full support |
+| **grid** — `BackwardInduction` / `PolicyIteration` | ≤ ~6 dimensions, or a **mixed** action space, or infinite horizon | continuous + discrete + Markov | continuous + **discrete** | **exact** across the full support |
 | **`iLQG`** | smooth continuous control; you want the exact/near-exact answer, fast | continuous | continuous | exact on LQ; local optimum otherwise |
 | **`PolicyGradient`** | high-D continuous with a differentiable model — **the default past the grid** | continuous | continuous | near-optimal, no overestimation |
-| **`ActorCritic`** | high-D **with discrete states** or non-smooth dynamics you can't differentiate | continuous + **discrete** | continuous | approximate (bootstrapped, certified) |
+| **`ActorCritic`** | high-D **with discrete states/actions** or non-smooth dynamics you can't differentiate | continuous + **discrete** | continuous **or discrete** | approximate (bootstrapped, certified) |
 
-A quick decision: **discrete actions or low dimension → grid.** Otherwise, high-D and continuous — **smooth/LQ → `iLQG`**, **a differentiable model → `PolicyGradient`** (the clean default), and **discrete states or non-differentiable dynamics → `ActorCritic`** (the only one that can bootstrap past a step it can't differentiate).
+A quick decision: **low dimension → grid** (the simplest route for discrete actions too). Otherwise high-D — **smooth/LQ continuous → `iLQG`**, **differentiable continuous → `PolicyGradient`** (the clean default), and **discrete states/actions or non-differentiable dynamics → `ActorCritic`** (the only one that can bootstrap past a step it can't differentiate — and the only neural option for a discrete action, which it solves by enumerated fitted value iteration).
 
 All four are **model-based** — they need your `transition` and `reward`, which is how they differ from **model-free RL** (for when you have no model at all). Given a model, three of the four *exploit its gradient* directly; the actor–critic is the fallback for exactly the cases where that gradient doesn't exist.
 
