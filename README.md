@@ -1,6 +1,6 @@
 # bellgrid
 
-**Solve stochastic dynamic programs on the GPU.** Mixed continuous and discrete state, mixed continuous and discrete action. One `Problem` spec, a **portfolio of solvers matched to its structure**: **exact** GPU grid sweeps at low dimension, and — where a grid can't reach — **analytic trajectory optimization** (`iLQG`), **pathwise policy gradients** (`PolicyGradient`), and a **model-based neural actor–critic** (`ActorCritic`). Because every solver shares the spec, each certifies the others — or an exact analytical oracle — wherever they overlap.
+**Solve stochastic dynamic programs on the GPU.** You write the model — the `transition` and `reward` as ordinary Python functions — and bellgrid returns the optimal policy and value function. There's no environment to explore: this is **model-based** stochastic control / dynamic programming, *not* model-free RL (which is for when you have no model at all). Mixed continuous and discrete state, mixed continuous and discrete action. One `Problem` spec, a **portfolio of solvers matched to its structure**: **exact** GPU grid sweeps at low dimension, and — where a grid can't reach — **analytic trajectory optimization** (`iLQG`), **pathwise policy gradients** (`PolicyGradient`), and a **model-based neural actor–critic** (`ActorCritic`). Because every solver shares the spec, each certifies the others — or an exact analytical oracle — wherever they overlap.
 
 A bellgrid `Problem` specifies:
 
@@ -114,13 +114,15 @@ policy, value = solve(problem, solver=PolicyGradient(), device="cuda")   # no st
 
 All four are **model-based** — they use your known, differentiable `transition`/`reward` and the *same exact shock quadrature* as the grid, not a black-box environment they must explore. The split among them is one tradeoff seen from two sides: backpropagating *through* the model (`iLQG`, `PolicyGradient`) is exact and overestimation-free but **needs** a differentiable model; bootstrapping a *learned* value (`ActorCritic`) tolerates discrete / non-smooth dynamics but pays for it in approximation bias. Pick the one whose assumption your problem actually satisfies.
 
+**One scaling caveat for all of them:** the shock expectation is *exact tensor-product quadrature*, so its cost is `n_quad ^ (number of independent shocks)`. The high-D solvers scale the **state** dimension freely (that's the whole point), but the **shock** dimension stays curse-of-dimensionality bound — a few independent shocks, or many assets driven by a low-dimensional common factor, is fine; dozens of *independent* shocks are not.
+
 **The correctness contract.** Because every solver shares the `Problem` spec, they certify each other — and where the problem is linear-quadratic, a matrix-Riccati closed form is an exact oracle at *any* dimension. [`11_liquidation`](https://github.com/tbb300/bellgrid/blob/main/examples/11_liquidation/liquidation.ipynb) certifies `iLQG` against it to **machine precision** and the neural solvers to ~1–2% at **80 state dimensions** (~10¹⁷⁶ equivalent grid cells). Where no oracle exists ([`10_hydropower`](https://github.com/tbb300/bellgrid/blob/main/examples/10_hydropower/hydropower.ipynb)), the grid certifies the high-D solvers on the low-D overlap and `simulate()` checks forward-consistency at scale. Prove it where you can; trust it where you must.
 
 Scope (v1): `iLQG` and `PolicyGradient` need an all-`ContinuousState`, `ContinuousAction`, scalar-discount, finite-horizon problem (the model must be differentiable). `ActorCritic` additionally handles `DiscreteState` and all-`DiscreteAction` problems. `MarkovChain`, *mixed* continuous+discrete action spaces, callable discount, and infinite horizon use the grid solvers.
 
 ## Examples
 
-Eleven canonical problems, each side-by-side with an analytical or numerical reference. Open the notebooks in JupyterLab or [view them on GitHub](https://github.com/tbb300/bellgrid/tree/main/examples).
+Twelve canonical problems, each side-by-side with an analytical or numerical reference. Open the notebooks in JupyterLab or [view them on GitHub](https://github.com/tbb300/bellgrid/tree/main/examples).
 
 | Notebook | Problem | Validates against |
 |---|---|---|
