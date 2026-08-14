@@ -1395,13 +1395,48 @@ def _nearest_neighbor(
     return values[closer]
 
 
+def _snap_to_nearest(
+    axes: list, queries: list
+) -> list:
+    """Replace each continuous query with its nearest axis coordinate.
+
+    Integer queries address discrete / markov axes exactly and pass through
+    untouched. Used for discrete-action lookup, where interpolating between
+    grid nodes is meaningless -- see :class:`_Policy`.
+    """
+    snapped = []
+    for axis, q in zip(axes, queries):
+        if not q.dtype.is_floating_point or axis.numel() < 2:
+            snapped.append(q)
+            continue
+        a = axis.to(q.dtype)
+        idx = torch.clamp(
+            torch.searchsorted(a.contiguous(), q.contiguous(), right=False),
+            1, a.numel() - 1,
+        )
+        left, right = idx - 1, idx
+        closer = torch.where(
+            (q - a[left]).abs() <= (a[right] - q).abs(), left, right
+        )
+        snapped.append(a[closer])
+    return snapped
+
+
 class _Policy:
     """Callable wrapping the time-indexed optimal action arrays.
 
     Continuous actions interpolate multilinearly across continuous state
-    axes and exact-gather across discrete / markov axes. Discrete actions
-    return the optimal index: for single-continuous-state problems we use
-    nearest-neighbor; for K>1 or mixed states we multilinear and round.
+    axes and exact-gather across discrete / markov axes.
+
+    Discrete actions return the optimal index, and are looked up by
+    **nearest neighbour**, never interpolated. An action index is a label,
+    not a quantity: if one grid node's optimum is index 13 and its
+    neighbour's is 52, the average is index 33, which is generally optimal
+    at neither and may not even be adjacent to either in behaviour. This
+    previously interpolated-and-rounded whenever there was more than one
+    continuous state, which silently returned actions no state prefers --
+    on a lifecycle model it made a fraction of simulated households consume
+    their entire balance in a single year.
     """
 
     def __init__(
@@ -1437,8 +1472,12 @@ class _Policy:
                         self._axes_for_lookup[0], arr, queries[0]
                     )
                 else:
+                    # Snap first: with every query on a node the multilinear
+                    # weights are exactly 1 and 0, so this is an exact gather
+                    # of one stored index rather than a blend of several.
                     out = multilinear(
-                        self._axes_for_lookup, arr.to(torch.float64), queries
+                        self._axes_for_lookup, arr.to(torch.float64),
+                        _snap_to_nearest(self._axes_for_lookup, queries),
                     ).round().to(arr.dtype)
             else:
                 out = multilinear(self._axes_for_lookup, arr, queries)

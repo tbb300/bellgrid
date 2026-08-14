@@ -7,6 +7,16 @@ Built-in warps:
 - ``"log"`` — ``x → log(x)``. Concentrates points exponentially toward the
   lower end. Requires ``low > 0``.
 
+Either may carry a scale: ``"asinh:50000"`` means ``x → asinh(x / 50000)``.
+The scale is the width of the region the warp treats as "near zero", so it
+must be set in the state's own units. This matters more than it looks: the
+unscaled ``asinh`` is linear only up to ``x ≈ 1``, so on a grid denominated
+in dollars it is effectively ``log`` from a dollar upward and spends most of
+its points below ``$10`` — for a wealth grid spanning millions, over half the
+knots land in a region no path ever visits. Pick a scale near the smallest
+value you want resolved (for a wealth grid, roughly the poorest state that
+matters) and the points spread evenly across the range that carries mass.
+
 The warp can be set on the WarpedGrid itself or inherited from the
 ContinuousState declaration (the latter is the documented default — see
 ``docs/api.md``). The same warp also drives interpolation: queries are
@@ -28,13 +38,36 @@ _BUILTIN_WARPS = {
 }
 
 
+def _warp_name(warp) -> str:
+    """Base warp name, dropping any ``:scale`` suffix."""
+    return warp.partition(":")[0] if isinstance(warp, str) else warp
+
+
 def _resolve_warp(warp):
     if isinstance(warp, str):
-        if warp not in _BUILTIN_WARPS:
+        name, _, arg = warp.partition(":")
+        if name not in _BUILTIN_WARPS:
             raise ValueError(
                 f"unknown warp {warp!r}; choose from {sorted(_BUILTIN_WARPS)}"
             )
-        return _BUILTIN_WARPS[warp]
+        if not arg:
+            return _BUILTIN_WARPS[name]
+        try:
+            scale = float(arg)
+        except ValueError:
+            raise ValueError(
+                f"warp scale must be a number; got {arg!r} in {warp!r}"
+            ) from None
+        if not (scale > 0.0) or not math.isfinite(scale):
+            raise ValueError(
+                f"warp scale must be positive and finite; got {scale!r}"
+            )
+        fwd, tensor_fwd, tensor_inv = _BUILTIN_WARPS[name]
+        return (
+            lambda x, _s=scale, _f=fwd: _f(x / _s),
+            lambda x, _s=scale, _f=tensor_fwd: _f(x / _s),
+            lambda u, _s=scale, _f=tensor_inv: _f(u) * _s,
+        )
     raise NotImplementedError(
         f"callable warps not yet supported; got {type(warp).__name__}"
     )
@@ -71,7 +104,7 @@ class WarpedGrid:
             )
 
         effective_warp = self._effective_warp(warp)
-        if effective_warp == "log" and low <= 0:
+        if _warp_name(effective_warp) == "log" and low <= 0:
             raise ValueError(f"log warp requires low > 0, got low={low}")
 
         scalar_fwd, _, tensor_inv = _resolve_warp(effective_warp)
@@ -93,7 +126,7 @@ class WarpedGrid:
         the resulting out-of-range query)."""
         effective_warp = self._effective_warp(warp)
         _, tensor_fwd, _ = _resolve_warp(effective_warp)
-        if effective_warp == "log":
+        if _warp_name(effective_warp) == "log":
             x = torch.clamp(x, min=torch.finfo(x.dtype).tiny)
         return tensor_fwd(x)
 
